@@ -1,10 +1,16 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
 from .models import (
-    UserProfile, SellerProfile, Product, Game, GameParticipant,
+    Category, UserProfile, SellerProfile, Product, Game, GameParticipant,
     GameResult, Wallet, WalletTransaction, PaymentSubmission,
     ProductDelivery, Notification, AuditLog
 )
+
+class CategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Category
+        fields = '__all__'
+
 
 class UserSerializer(serializers.ModelSerializer):
     role = serializers.CharField(source='profile.role', read_only=True)
@@ -60,6 +66,7 @@ class GameSerializer(serializers.ModelSerializer):
     product_details = ProductSerializer(source='product', read_only=True)
     seller_name = serializers.CharField(source='seller.business_name', read_only=True)
     participants_count = serializers.IntegerField(source='participants.count', read_only=True)
+    participants = GameParticipantSerializer(many=True, read_only=True)
     result = GameResultSerializer(read_only=True)
 
     class Meta:

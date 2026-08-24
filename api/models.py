@@ -1,6 +1,17 @@
 from django.db import models
 from django.contrib.auth.models import User
 from django.utils import timezone
+from decimal import Decimal
+
+class Category(models.Model):
+    name = models.CharField(max_length=100, unique=True)
+    slug = models.SlugField(max_length=100, unique=True)
+    icon = models.CharField(max_length=50, default='package')
+    description = models.TextField(blank=True, default='')
+
+    def __str__(self):
+        return self.name
+
 
 class UserProfile(models.Model):
     ROLE_CHOICES = [
@@ -61,7 +72,7 @@ class Product(models.Model):
 
     seller = models.ForeignKey(SellerProfile, on_delete=models.CASCADE, related_name='products')
     title = models.CharField(max_length=200)
-    category = models.CharField(max_length=100)
+    category = models.CharField(max_length=100, default='Electronics')
     description = models.TextField()
     image_url = models.URLField(blank=True, default='')
     condition = models.CharField(max_length=30, choices=CONDITION_CHOICES, default='NEW')
@@ -82,6 +93,8 @@ class Game(models.Model):
         ('SECRET_NUMBER', 'Secret Number'),
         ('PREDICTION', 'Prediction Challenge'),
         ('PRECISION_TIMER', 'Precision Timer'),
+        ('HEAD_TO_HEAD', 'Head-to-Head'),
+        ('TOURNAMENT', 'Tournament'),
     ]
     STATUS_CHOICES = [
         ('DRAFT', 'Draft'),
@@ -91,6 +104,7 @@ class Game(models.Model):
         ('COMPLETED', 'Completed'),
         ('CANCELLED', 'Cancelled'),
         ('REFUNDED', 'Refunded'),
+        ('REJECTED', 'Rejected'),
     ]
 
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='games')
@@ -102,15 +116,37 @@ class Game(models.Model):
     total_boxes = models.IntegerField(default=100, help_text="Total available boxes for Treasure Box")
     duration_minutes = models.IntegerField(default=120)
     
+    # Discovery & Popularity metadata
+    views_count = models.IntegerField(default=0)
+    is_featured = models.BooleanField(default=False)
+    is_recommended = models.BooleanField(default=False)
+    question_prompt = models.CharField(max_length=255, blank=True, null=True, help_text="Prompt for prediction or trivia games")
+    bracket_data = models.JSONField(blank=True, null=True, help_text="Tournament or Head-to-Head bracket data")
+    target_time_sec = models.DecimalField(max_digits=6, decimal_places=3, default=Decimal('10.000'), help_text="Custom target time in seconds for Precision Timer challenge")
+
     # Target answer/secret value (stored securely on backend)
     secret_target = models.CharField(max_length=255, blank=True, null=True, help_text="Secret target number, prediction answer, or target time in ms")
     
     rules_description = models.TextField()
+    rejection_reason = models.TextField(blank=True, default='')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='DRAFT')
     
     created_at = models.DateTimeField(auto_now_add=True)
     start_time = models.DateTimeField(null=True, blank=True)
     end_time = models.DateTimeField(null=True, blank=True)
+
+    def is_bidding_ended(self):
+        from datetime import timedelta
+        now = timezone.now()
+        if self.end_time and now >= self.end_time:
+            return True
+        if self.created_at and self.duration_minutes:
+            timer_end = self.created_at + timedelta(minutes=self.duration_minutes)
+            if now >= timer_end:
+                return True
+        if self.max_participants > 0 and self.participants.count() >= self.max_participants:
+            return True
+        return False
 
     def __str__(self):
         return f"{self.title} ({self.get_game_type_display()}) - {self.status}"
@@ -126,12 +162,14 @@ class GameParticipant(models.Model):
     selected_card = models.CharField(max_length=20, null=True, blank=True)
     prediction_answer = models.FloatField(null=True, blank=True)
     timer_delta_ms = models.IntegerField(null=True, blank=True)
+    h2h_choice = models.CharField(max_length=100, null=True, blank=True)
+    tournament_slot = models.IntegerField(null=True, blank=True)
     
     joined_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        # Prevent double entry per user if restricted, or box duplication for Treasure Box
-        unique_together = [('game', 'user'), ('game', 'selected_box')]
+        # Prevent box duplication for Treasure Box across participants
+        unique_together = [('game', 'selected_box')]
 
     def __str__(self):
         return f"{self.user.username} in {self.game.title}"
