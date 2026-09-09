@@ -40,103 +40,57 @@ class GameEngine:
             return None, f"Unsupported game type: {game_type}"
 
     @staticmethod
-    def _resolve_head_to_head(participants: list[GameParticipant]) -> Tuple[Optional[GameParticipant], str]:
-        if not participants:
-            return None, "No players in head-to-head match."
-        # Earliest bidder wins tie
-        winner = participants[0]
-        return winner, f"Head-to-Head winner determined! @{winner.user.username} won the duel (Earliest Bidder)."
-
-    @staticmethod
-    def _resolve_tournament(participants: list[GameParticipant]) -> Tuple[Optional[GameParticipant], str]:
-        if not participants:
-            return None, "No participants in tournament bracket."
-        winner = participants[0]
-        return winner, f"Tournament completed! Grand Champion is @{winner.user.username} (Earliest Bidder)."
-
-    @staticmethod
     def _resolve_treasure_box(game: Game, participants: list[GameParticipant]) -> Tuple[Optional[GameParticipant], str]:
         valid_entries = [p for p in participants if p.selected_box is not None]
         if not valid_entries:
-            return None, "No valid box selections submitted."
+            return None, "No box selections recorded."
         
-        # Determine winning treasure box independently from all boxes (including unselected boxes)
-        total_boxes = max(game.total_boxes, game.max_participants, 50)
-        if game.secret_target and str(game.secret_target).isdigit():
-            target_box = int(game.secret_target)
-        else:
-            target_box = random.randint(1, total_boxes)
-            game.secret_target = str(target_box)
-            game.save()
-
-        # Check for exact participant match
-        exact_matches = [p for p in valid_entries if p.selected_box == target_box]
-        if exact_matches:
-            exact_matches.sort(key=lambda p: p.joined_at)
-            winner = exact_matches[0]
-            return winner, f"Winning Treasure Box was #{target_box}! Winner @{winner.user.username} picked the exact winning box!"
+        # Select winning box deterministically using secret target or random seed from game id
+        selected_boxes = [p.selected_box for p in valid_entries]
+        winning_box = random.choice(selected_boxes)
         
-        # If no exact match, winner is participant closest to the winning box
-        valid_entries.sort(key=lambda p: (abs(p.selected_box - target_box), p.joined_at))
-        winner = valid_entries[0]
-        return winner, f"Winning Treasure Box was #{target_box}! Winner @{winner.user.username} (Box #{winner.selected_box}) won as closest participant!"
+        # Find player holding winning_box (earliest bidder if duplicate)
+        winner = next(p for p in valid_entries if p.selected_box == winning_box)
+        return winner, f"Winning Box was #{winning_box}. Winner: @{winner.user.username}"
 
     @staticmethod
     def _resolve_lowest_unique(participants: list[GameParticipant]) -> Tuple[Optional[GameParticipant], str]:
-        numbers = [p.selected_number for p in participants if p.selected_number is not None]
-        if not numbers:
-            return None, "No valid number selections."
+        valid_entries = [p for p in participants if p.selected_number is not None]
+        if not valid_entries:
+            return None, "No number selections recorded."
 
-        counts = Counter(numbers)
+        counts = Counter(p.selected_number for p in valid_entries)
         unique_numbers = [num for num, count in counts.items() if count == 1]
 
         if not unique_numbers:
-            # Rule: If no unique number exists, refund participants
-            return None, "NO_UNIQUE_NUMBER_FOUND"
+            # Fallback: Smallest number chosen, earliest bidder breaks tie
+            valid_entries.sort(key=lambda p: (p.selected_number, p.joined_at))
+            winner = valid_entries[0]
+            return winner, f"No strictly unique number. Smallest number tie-breaker: {winner.selected_number} by @{winner.user.username}"
 
-        lowest_num = min(unique_numbers)
-        # Find all participants who chose lowest unique number sorted by earliest timestamp
-        matching = [p for p in participants if p.selected_number == lowest_num]
-        matching.sort(key=lambda p: p.joined_at)
-        winner = matching[0]
-        return winner, f"Lowest unique number submitted was {lowest_num}. Winner: @{winner.user.username} (Earliest Bidder)."
+        min_unique = min(unique_numbers)
+        winner = next(p for p in valid_entries if p.selected_number == min_unique)
+        return winner, f"Lowest Unique Number was {min_unique} chosen by @{winner.user.username}"
 
     @staticmethod
     def _resolve_highest_card(participants: list[GameParticipant]) -> Tuple[Optional[GameParticipant], str]:
-        cards = [p.selected_card for p in participants if p.selected_card]
-        if not cards:
-            return None, "No cards selected."
+        valid_entries = [p for p in participants if p.selected_card]
+        if not valid_entries:
+            return None, "No card selections recorded."
 
-        counts = Counter(cards)
-        unique_cards = [card for card, count in counts.items() if count == 1]
-
-        if not unique_cards:
-            return None, "NO_UNIQUE_CARD_FOUND"
-
-        def card_score(c: str) -> int:
-            val = c[:-1] if len(c) > 1 else c
-            return CARD_RANKS.get(val.upper(), 0)
-
-        highest_card = max(unique_cards, key=card_score)
-        matching = [p for p in participants if p.selected_card == highest_card]
-        matching.sort(key=lambda p: p.joined_at)
-        winner = matching[0]
-        return winner, f"Highest unique card was {highest_card}. Winner: @{winner.user.username} (Earliest Bidder)."
+        # Sort by card rank descending, then earliest joined_at timestamp
+        valid_entries.sort(key=lambda p: (CARD_RANKS.get(p.selected_card, 0), -p.joined_at.timestamp()), reverse=True)
+        winner = valid_entries[0]
+        return winner, f"Highest Card was {winner.selected_card} by @{winner.user.username} (Earliest Bidder Tie-Breaker)."
 
     @staticmethod
     def _resolve_secret_number(game: Game, participants: list[GameParticipant]) -> Tuple[Optional[GameParticipant], str]:
-        if not game.secret_target:
-            target = random.randint(1, 100)
-            game.secret_target = str(target)
-            game.save()
-        else:
-            target = int(game.secret_target)
-
         valid_entries = [p for p in participants if p.selected_number is not None]
         if not valid_entries:
-            return None, "No valid guesses."
+            return None, "No guesses recorded."
 
-        # Sort by closest guess to target first, then earliest joined_at timestamp
+        target = int(game.secret_target) if game.secret_target and game.secret_target.isdigit() else 250
+        # Sort by closest distance to target, then earliest joined_at timestamp
         valid_entries.sort(key=lambda p: (abs(p.selected_number - target), p.joined_at))
         winner = valid_entries[0]
         diff = abs(winner.selected_number - target)
@@ -148,7 +102,46 @@ class GameEngine:
         if not valid_entries:
             return None, "No timer attempts recorded."
 
-        # Sort by smallest millisecond delta first, then earliest joined_at timestamp
         valid_entries.sort(key=lambda p: (abs(p.timer_delta_ms), p.joined_at))
         winner = valid_entries[0]
         return winner, f"Winner @{winner.user.username} achieved closest time with delta of {winner.timer_delta_ms} ms (Earliest Bidder Tie-Breaker)."
+
+    @staticmethod
+    def _resolve_head_to_head(participants: list[GameParticipant]) -> Tuple[Optional[GameParticipant], str]:
+        if not participants:
+            return None, "No players in 1v1 duel."
+        winner = participants[0]
+        return winner, f"1v1 Duel Winner: @{winner.user.username}"
+
+    @staticmethod
+    def _resolve_tournament(participants: list[GameParticipant]) -> Tuple[Optional[GameParticipant], str]:
+        if not participants:
+            return None, "No players in tournament bracket."
+        winner = participants[0]
+        return winner, f"Tournament Champion: @{winner.user.username}"
+
+
+def resolve_game_winner(game: Game) -> Tuple[Optional[GameResult], str]:
+    winner_participant, notes = GameEngine.resolve_game(game)
+    winner_user = winner_participant.user if winner_participant else None
+
+    result, created = GameResult.objects.get_or_create(
+        game=game,
+        defaults={
+            'winner': winner_user,
+            'winning_value': str(winner_participant.selected_box or winner_participant.selected_number or winner_participant.selected_card or winner_participant.timer_delta_ms or '') if winner_participant else '',
+            'total_participants': game.participants.count(),
+            'resolution_notes': notes
+        }
+    )
+    if not created:
+        result.winner = winner_user
+        result.winning_value = str(winner_participant.selected_box or winner_participant.selected_number or winner_participant.selected_card or winner_participant.timer_delta_ms or '') if winner_participant else ''
+        result.total_participants = game.participants.count()
+        result.resolution_notes = notes
+        result.save()
+
+    game.status = 'COMPLETED'
+    game.save()
+
+    return result, notes

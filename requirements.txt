@@ -1,8 +1,4 @@
-asgiref==3.12.1
-Django==6.1
-sqlparse==0.5.5
-tzdata==2026.3
-djangorestframework
-django-cors-headers
-Pillow
-
+Django>=4.2.0,<7.0.0
+djangorestframework>=3.14.0
+django-cors-headers>=4.0.0
+requests>=2.31.0

@@ -1,13 +1,13 @@
 from django.contrib import admin
 from .models import (
     UserProfile, SellerProfile, Product, Game, GameParticipant,
-    GameResult, Wallet, WalletTransaction, PaymentSubmission,
-    ProductDelivery, Notification, AuditLog
+    GameResult, Favorite, Wallet, WalletTransaction, PaymentSubmission,
+    WithdrawalRequest, ProductDelivery, Notification, AuditLog
 )
 
 @admin.register(UserProfile)
 class UserProfileAdmin(admin.ModelAdmin):
-    list_display = ['user', 'role', 'account_status', 'created_at']
+    list_display = ['user', 'role', 'phone_number', 'account_status', 'created_at']
     list_filter = ['role', 'account_status']
 
 @admin.register(SellerProfile)
@@ -33,19 +33,28 @@ class GameParticipantAdmin(admin.ModelAdmin):
 class GameResultAdmin(admin.ModelAdmin):
     list_display = ['game', 'winner', 'calculated_at']
 
+@admin.register(Favorite)
+class FavoriteAdmin(admin.ModelAdmin):
+    list_display = ['user', 'game', 'created_at']
+
 @admin.register(Wallet)
 class WalletAdmin(admin.ModelAdmin):
-    list_display = ['user', 'balance', 'updated_at']
+    list_display = ['user', 'balance', 'reserved_balance', 'updated_at']
 
 @admin.register(WalletTransaction)
 class WalletTransactionAdmin(admin.ModelAdmin):
-    list_display = ['wallet', 'transaction_type', 'amount', 'created_at']
-    list_filter = ['transaction_type']
+    list_display = ['wallet', 'transaction_type', 'direction', 'amount', 'status', 'created_at']
+    list_filter = ['transaction_type', 'direction', 'status']
 
 @admin.register(PaymentSubmission)
 class PaymentSubmissionAdmin(admin.ModelAdmin):
     list_display = ['user', 'payment_method', 'transaction_id', 'amount', 'status', 'submitted_at']
     list_filter = ['status', 'payment_method']
+
+@admin.register(WithdrawalRequest)
+class WithdrawalRequestAdmin(admin.ModelAdmin):
+    list_display = ['user', 'withdrawal_method', 'account_number', 'amount', 'status', 'submitted_at']
+    list_filter = ['status', 'withdrawal_method']
 
 @admin.register(ProductDelivery)
 class ProductDeliveryAdmin(admin.ModelAdmin):

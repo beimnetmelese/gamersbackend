@@ -1,23 +1,29 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
-    register_user, UserProfileViewSet, SellerProfileViewSet,
-    ProductViewSet, GameViewSet, CategoryViewSet, WalletViewSet, PaymentSubmissionViewSet,
-    ProductDeliveryViewSet, platform_analytics
+    register_user, login_user, logout_user, change_password, get_user_stats,
+    UserProfileViewSet, FavoriteViewSet, NotificationViewSet,
+    CategoryViewSet, GameViewSet, WalletViewSet, PaymentSubmissionViewSet,
+    WithdrawalRequestViewSet, UserAdminViewSet, SellerApplicationViewSet
 )
 
 router = DefaultRouter()
-router.register(r'profiles', UserProfileViewSet)
-router.register(r'sellers', SellerProfileViewSet)
-router.register(r'products', ProductViewSet)
-router.register(r'categories', CategoryViewSet)
-router.register(r'games', GameViewSet)
-router.register(r'wallets', WalletViewSet)
-router.register(r'payments', PaymentSubmissionViewSet)
-router.register(r'deliveries', ProductDeliveryViewSet)
+router.register(r'profiles', UserProfileViewSet, basename='userprofile')
+router.register(r'favorites', FavoriteViewSet, basename='favorite')
+router.register(r'notifications', NotificationViewSet, basename='notification')
+router.register(r'categories', CategoryViewSet, basename='category')
+router.register(r'games', GameViewSet, basename='game')
+router.register(r'wallets', WalletViewSet, basename='wallet')
+router.register(r'payments', PaymentSubmissionViewSet, basename='payment')
+router.register(r'withdrawals', WithdrawalRequestViewSet, basename='withdrawal')
+router.register(r'users', UserAdminViewSet, basename='useradmin')
+router.register(r'sellers', SellerApplicationViewSet, basename='sellerapp')
 
 urlpatterns = [
     path('auth/register/', register_user, name='register_user'),
-    path('analytics/', platform_analytics, name='platform_analytics'),
+    path('auth/login/', login_user, name='login_user'),
+    path('auth/logout/', logout_user, name='logout_user'),
+    path('auth/change_password/', change_password, name='change_password'),
+    path('profiles/me/stats/', get_user_stats, name='user_stats'),
     path('', include(router.urls)),
 ]

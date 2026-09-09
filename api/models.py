@@ -28,9 +28,16 @@ class UserProfile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
     role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='USER')
     account_status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ACTIVE')
+    phone_number = models.CharField(max_length=30, blank=True, default='')
     bio = models.TextField(blank=True, default='')
     avatar_url = models.URLField(blank=True, default='')
-    telegram_username = models.CharField(max_length=100, blank=True, default='')
+    
+    # Preferences & Settings
+    notification_preferences = models.JSONField(default=dict, blank=True, help_text="Email and In-App notification preferences")
+    privacy_settings = models.JSONField(default=dict, blank=True, help_text="Profile visibility and activity settings")
+    language = models.CharField(max_length=10, default='en')
+    telegram_chat_id = models.CharField(max_length=100, blank=True, default='', help_text="Optional Telegram Chat ID for notification mirroring")
+    
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
@@ -168,7 +175,6 @@ class GameParticipant(models.Model):
     joined_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        # Prevent box duplication for Treasure Box across participants
         unique_together = [('game', 'selected_box')]
 
     def __str__(self):
@@ -187,33 +193,30 @@ class GameResult(models.Model):
         return f"Result for {self.game.title}: Winner is {self.winner.username if self.winner else 'None'}"
 
 
-class Wallet(models.Model):
-    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='wallet')
-    balance = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    def __str__(self):
-        return f"{self.user.username}'s Wallet: {self.balance} ETB"
-
-
-class WalletTransaction(models.Model):
-    TYPE_CHOICES = [
-        ('DEPOSIT', 'Deposit'),
-        ('GAME_ENTRY', 'Game Entry Fee'),
-        ('REFUND', 'Refund'),
-        ('WITHDRAWAL', 'Withdrawal'),
-        ('REWARD', 'Reward / Prize'),
-    ]
-    
-    wallet = models.ForeignKey(Wallet, on_delete=models.CASCADE, related_name='transactions')
-    transaction_type = models.CharField(max_length=20, choices=TYPE_CHOICES)
-    amount = models.DecimalField(max_digits=12, decimal_places=2)
-    reference_id = models.CharField(max_length=100, blank=True, default='')
-    note = models.CharField(max_length=255, blank=True, default='')
+class Favorite(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='favorites')
+    game = models.ForeignKey(Game, on_delete=models.CASCADE, related_name='favorited_by')
     created_at = models.DateTimeField(auto_now_add=True)
 
+    class Meta:
+        unique_together = [('user', 'game')]
+
     def __str__(self):
-        return f"{self.transaction_type} {self.amount} ETB for {self.wallet.user.username}"
+        return f"{self.user.username} favorited {self.game.title}"
+
+
+class Wallet(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='wallet')
+    balance = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    reserved_balance = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'), help_text="Funds reserved for pending withdrawals")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    @property
+    def available_balance(self) -> Decimal:
+        return max(Decimal('0.00'), self.balance - self.reserved_balance)
+
+    def __str__(self):
+        return f"{self.user.username}'s Wallet: Balance {self.balance} ETB (Avail: {self.available_balance} ETB)"
 
 
 class PaymentSubmission(models.Model):
@@ -225,7 +228,7 @@ class PaymentSubmission(models.Model):
     ]
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='payment_submissions')
-    payment_method = models.CharField(max_length=50) # Telebirr, CBE Birr, Bank Transfer
+    payment_method = models.CharField(max_length=50) # Telebirr, CBE Birr, Bank Transfer, Awash Birr
     transaction_id = models.CharField(max_length=100, unique=True)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     proof_image = models.ImageField(upload_to='payment_proofs/', null=True, blank=True)
@@ -235,7 +238,70 @@ class PaymentSubmission(models.Model):
     reviewed_at = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
-        return f"Tx {self.transaction_id} ({self.amount} ETB) - {self.status}"
+        return f"Deposit Tx {self.transaction_id} ({self.amount} ETB) - {self.status}"
+
+
+class WithdrawalRequest(models.Model):
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending Verification'),
+        ('APPROVED', 'Approved'),
+        ('REJECTED', 'Rejected'),
+        ('CANCELLED', 'Cancelled'),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='withdrawal_requests')
+    wallet = models.ForeignKey(Wallet, on_delete=models.CASCADE, related_name='withdrawal_requests')
+    withdrawal_method = models.CharField(max_length=50) # Telebirr, CBE Birr, Bank Transfer, Awash Birr
+    account_number = models.CharField(max_length=100)
+    account_name = models.CharField(max_length=150, blank=True, default='')
+    phone_number = models.CharField(max_length=30, blank=True, default='')
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    transaction_id = models.CharField(max_length=100, unique=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+    admin_note = models.TextField(blank=True, default='')
+    submitted_at = models.DateTimeField(auto_now_add=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"Withdrawal {self.transaction_id} ({self.amount} ETB) - {self.status}"
+
+
+class WalletTransaction(models.Model):
+    TYPE_CHOICES = [
+        ('DEPOSIT', 'Deposit'),
+        ('GAME_ENTRY', 'Game Entry Fee'),
+        ('REFUND', 'Refund'),
+        ('WITHDRAWAL', 'Withdrawal'),
+        ('REWARD', 'Reward / Prize'),
+    ]
+    DIRECTION_CHOICES = [
+        ('CREDIT', 'Credit'),
+        ('DEBIT', 'Debit'),
+    ]
+    STATUS_CHOICES = [
+        ('COMPLETED', 'Completed'),
+        ('PENDING', 'Pending'),
+        ('REJECTED', 'Rejected'),
+        ('CANCELLED', 'Cancelled'),
+    ]
+    
+    wallet = models.ForeignKey(Wallet, on_delete=models.CASCADE, related_name='transactions')
+    transaction_type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    direction = models.CharField(max_length=10, choices=DIRECTION_CHOICES, default='CREDIT')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    reference_id = models.CharField(max_length=100, blank=True, default='')
+    note = models.CharField(max_length=255, blank=True, default='')
+    
+    # Relationships for full financial traceability
+    related_deposit = models.ForeignKey(PaymentSubmission, on_delete=models.SET_NULL, null=True, blank=True, related_name='wallet_transactions')
+    related_withdrawal = models.ForeignKey(WithdrawalRequest, on_delete=models.SET_NULL, null=True, blank=True, related_name='wallet_transactions')
+    related_game = models.ForeignKey(Game, on_delete=models.SET_NULL, null=True, blank=True, related_name='wallet_transactions')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.transaction_type} ({self.direction}) {self.amount} ETB for {self.wallet.user.username}"
 
 
 class ProductDelivery(models.Model):
@@ -262,10 +328,20 @@ class ProductDelivery(models.Model):
 
 
 class Notification(models.Model):
+    EVENT_CHOICES = [
+        ('DEPOSIT', 'Deposit'),
+        ('WITHDRAWAL', 'Withdrawal'),
+        ('GAME_EVENT', 'Game Event'),
+        ('GAME_WIN', 'Game Win'),
+        ('GAME_LOSS', 'Game Loss'),
+        ('REFUND', 'Refund'),
+        ('SYSTEM', 'System Announcement'),
+    ]
+
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notifications')
     title = models.CharField(max_length=150)
     message = models.TextField()
-    event_type = models.CharField(max_length=50, default='SYSTEM')
+    event_type = models.CharField(max_length=50, choices=EVENT_CHOICES, default='SYSTEM')
     is_read = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
