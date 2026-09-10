@@ -288,7 +288,8 @@ class PaymentSubmissionViewSet(viewsets.ModelViewSet):
 
     def create(self, request, *args, **kwargs):
         user = request.user
-        payment_method = request.data.get('payment_method', 'Telebirr')
+        payment_method = request.data.get('payment_method', 'Commercial Bank of Ethiopia (CBE)')
+        bank = request.data.get('bank', None)
         transaction_id = request.data.get('transaction_id', '')
         amount_raw = request.data.get('amount')
         proof_image = request.FILES.get('proof_image', None)
@@ -297,21 +298,25 @@ class PaymentSubmissionViewSet(viewsets.ModelViewSet):
         if amount_dec is None or amount_dec <= Decimal('0'):
             return Response({'error': 'Invalid amount format. Must be greater than 0 ETB.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        success, msg, deposit = PaymentService.create_deposit_submission(
+        success, msg, deposit, result_data = PaymentService.create_deposit_submission(
             user=user,
             payment_method=payment_method,
             transaction_id=transaction_id,
             amount=amount_dec,
-            proof_image=proof_image
+            proof_image=proof_image,
+            bank=bank
         )
 
-        if not success:
+        if not success and not deposit:
             return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response({
+            'success': success,
+            'verified': result_data.get('verified', False),
             'message': msg,
-            'submission': PaymentSubmissionSerializer(deposit).data
-        }, status=status.HTTP_201_CREATED)
+            'submission': PaymentSubmissionSerializer(deposit).data if deposit else None,
+            'result_data': result_data
+        }, status=status.HTTP_200_OK if success else status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
@@ -348,6 +353,35 @@ class PaymentSubmissionViewSet(viewsets.ModelViewSet):
             return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response({'message': msg, 'submission': PaymentSubmissionSerializer(payment).data})
+
+    @action(detail=True, methods=['delete', 'post'])
+    def delete_log(self, request, pk=None):
+        if not is_user_admin(request.user):
+            return Response({'error': 'Admin access required.'}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            deposit = PaymentSubmission.objects.get(pk=pk)
+            deposit.delete()
+            return Response({'message': f'Deposit log #{pk} deleted successfully.'})
+        except PaymentSubmission.DoesNotExist:
+            return Response({'error': 'Deposit log not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    @action(detail=False, methods=['post'])
+    def bulk_delete(self, request):
+        if not is_user_admin(request.user):
+            return Response({'error': 'Admin access required.'}, status=status.HTTP_403_FORBIDDEN)
+
+        ids = request.data.get('ids', [])
+        status_filter = request.data.get('status', None)
+
+        if ids:
+            deleted_count, _ = PaymentSubmission.objects.filter(id__in=ids).delete()
+        elif status_filter:
+            deleted_count, _ = PaymentSubmission.objects.filter(status=status_filter).delete()
+        else:
+            return Response({'error': 'Please provide log IDs or status filter to delete.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({'message': f'Successfully deleted {deleted_count} deposit log(s).'})
 
 
 class WithdrawalRequestViewSet(viewsets.ModelViewSet):

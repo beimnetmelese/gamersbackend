@@ -111,33 +111,42 @@ class FinancialAndServicesTests(TestCase):
         self.wallet = WalletService.get_or_create_wallet(self.user)
 
     def test_deposit_and_idempotent_approval(self):
-        success, msg, dep = PaymentService.create_deposit_submission(
-            user=self.user,
-            payment_method="Telebirr",
-            transaction_id="TX_TEST_001",
-            amount=Decimal("500.00")
-        )
-        self.assertTrue(success)
-        self.assertEqual(dep.status, "PENDING")
-        self.assertEqual(self.wallet.balance, Decimal("0.00"))
+        from unittest.mock import patch
+        with patch('api.verification_service.PaymentVerificationService.verify_payment') as mock_verify:
+            mock_verify.return_value = ({
+                "success": False,
+                "verified": False,
+                "already_used": False,
+                "message": "Service offline"
+            }, 502)
 
-        # Approve once
-        app_success, app_msg, dep = PaymentService.approve_deposit(dep.id, admin_user=self.admin)
-        self.assertTrue(app_success)
-        self.assertEqual(dep.status, "APPROVED")
+            success, msg, dep, res_data = PaymentService.create_deposit_submission(
+                user=self.user,
+                payment_method="Telebirr",
+                transaction_id="TX_TEST_001",
+                amount=Decimal("500.00")
+            )
+            self.assertTrue(success)
+            self.assertEqual(dep.status, "PENDING")
+            self.assertEqual(self.wallet.balance, Decimal("0.00"))
 
-        # Check wallet credited exactly 500 ETB
-        self.wallet.refresh_from_db()
-        self.assertEqual(self.wallet.balance, Decimal("500.00"))
+            # Approve once
+            app_success, app_msg, dep = PaymentService.approve_deposit(dep.id, admin_user=self.admin)
+            self.assertTrue(app_success)
+            self.assertEqual(dep.status, "APPROVED")
 
-        # Attempt double approval
-        app_success2, app_msg2, dep = PaymentService.approve_deposit(dep.id, admin_user=self.admin)
-        self.assertFalse(app_success2)
-        self.assertIn("already been processed", app_msg2)
+            # Check wallet credited exactly 500 ETB
+            self.wallet.refresh_from_db()
+            self.assertEqual(self.wallet.balance, Decimal("500.00"))
 
-        # Verify wallet balance did NOT double-credit
-        self.wallet.refresh_from_db()
-        self.assertEqual(self.wallet.balance, Decimal("500.00"))
+            # Attempt double approval
+            app_success2, app_msg2, dep = PaymentService.approve_deposit(dep.id, admin_user=self.admin)
+            self.assertFalse(app_success2)
+            self.assertIn("is already approved", app_msg2)
+
+            # Verify wallet balance did NOT double-credit
+            self.wallet.refresh_from_db()
+            self.assertEqual(self.wallet.balance, Decimal("500.00"))
 
     def test_withdrawal_reservation_and_approval(self):
         # Give user 1000 ETB balance

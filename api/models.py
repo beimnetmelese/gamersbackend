@@ -226,9 +226,14 @@ class PaymentSubmission(models.Model):
         ('REJECTED', 'Rejected'),
         ('REFUNDED', 'Refunded'),
     ]
+    BANK_CHOICES = [
+        ('cbe', 'Commercial Bank of Ethiopia'),
+        ('telebirr', 'Telebirr'),
+    ]
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='payment_submissions')
-    payment_method = models.CharField(max_length=50) # Telebirr, CBE Birr, Bank Transfer, Awash Birr
+    payment_method = models.CharField(max_length=50) # Commercial Bank of Ethiopia (CBE) or Telebirr
+    bank = models.CharField(max_length=20, choices=BANK_CHOICES, default='cbe')
     transaction_id = models.CharField(max_length=100, unique=True)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     proof_image = models.ImageField(upload_to='payment_proofs/', null=True, blank=True)
@@ -239,6 +244,38 @@ class PaymentSubmission(models.Model):
 
     def __str__(self):
         return f"Deposit Tx {self.transaction_id} ({self.amount} ETB) - {self.status}"
+
+
+class PaymentVerificationLog(models.Model):
+    BANK_CHOICES = [
+        ('cbe', 'Commercial Bank of Ethiopia'),
+        ('telebirr', 'Telebirr'),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='verification_logs', null=True, blank=True)
+    submission = models.ForeignKey(PaymentSubmission, on_delete=models.SET_NULL, null=True, blank=True, related_name='verification_logs')
+    bank = models.CharField(max_length=20, choices=BANK_CHOICES, default='cbe', db_index=True)
+    reference_id = models.CharField(max_length=100, db_index=True)
+    requested_amount = models.DecimalField(max_digits=12, decimal_places=2)
+    verified_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    currency = models.CharField(max_length=10, default='ETB')
+    reference_verified = models.BooleanField(default=False)
+    amount_verified = models.BooleanField(default=False)
+    receiver_verified = models.BooleanField(default=False)
+    is_verified = models.BooleanField(default=False)
+    status = models.CharField(max_length=50, null=True, blank=True)
+    error_message = models.TextField(blank=True, default='')
+    receipt_data = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Payment Verification Log'
+        verbose_name_plural = 'Payment Verification Logs'
+
+    def __str__(self):
+        return f"[{self.bank.upper()}] {self.reference_id} - Verified: {self.is_verified}"
 
 
 class WithdrawalRequest(models.Model):

@@ -112,32 +112,113 @@ class PaymentService:
         payment_method: str,
         transaction_id: str,
         amount: Decimal,
-        proof_image=None
-    ) -> Tuple[bool, str, Optional[PaymentSubmission]]:
+        proof_image=None,
+        bank: Optional[str] = None
+    ) -> Tuple[bool, str, Optional[PaymentSubmission], Dict[str, Any]]:
         transaction_id = str(transaction_id).strip()
         if PaymentSubmission.objects.filter(transaction_id__iexact=transaction_id).exists():
-            return False, f"Transaction ID '{transaction_id}' has already been submitted.", None
+            return False, f"Transaction ID '{transaction_id}' has already been submitted.", None, {}
 
         if amount <= Decimal('0.00'):
-            return False, "Deposit amount must be greater than 0.", None
+            return False, "Deposit amount must be greater than 0.", None, {}
+
+        # Map bank code from payment_method or explicit bank arg
+        bank_code = bank
+        if not bank_code:
+            method_lower = str(payment_method).lower()
+            if 'telebirr' in method_lower:
+                bank_code = 'telebirr'
+            else:
+                bank_code = 'cbe'
+        bank_code = bank_code.lower()
 
         deposit = PaymentSubmission.objects.create(
             user=user,
             payment_method=payment_method,
+            bank=bank_code,
             transaction_id=transaction_id,
             amount=amount,
             proof_image=proof_image,
             status='PENDING'
         )
 
-        NotificationService.send_notification(
+        # Run automated online verification
+        from .verification_service import PaymentVerificationService
+        verifier = PaymentVerificationService()
+        result_data, http_status = verifier.verify_payment(
+            reference_id=transaction_id,
+            requested_amount=amount,
+            bank=bank_code,
             user=user,
-            title="💳 Deposit Submitted",
-            message=f"Deposit proof of {amount} ETB (Tx: {transaction_id}) submitted. Waiting for admin verification.",
-            event_type='DEPOSIT'
+            submission=deposit
         )
 
-        return True, "Deposit submission recorded successfully. Pending Admin verification.", deposit
+        if result_data.get("verified") is True:
+            # Auto-approve & credit wallet
+            with transaction.atomic():
+                deposit.status = 'APPROVED'
+                deposit.reviewed_at = timezone.now()
+                deposit.admin_note = "Automated Verification Passed"
+                deposit.save()
+
+                wallet = WalletService.get_or_create_wallet(user)
+                wallet.balance += amount
+                wallet.save()
+
+                WalletTransaction.objects.create(
+                    wallet=wallet,
+                    transaction_type='DEPOSIT',
+                    direction='CREDIT',
+                    status='COMPLETED',
+                    amount=amount,
+                    reference_id=transaction_id,
+                    note=f"Auto-Verified Deposit via {payment_method}",
+                    related_deposit=deposit
+                )
+
+                NotificationService.send_notification(
+                    user=user,
+                    title="✅ Deposit Approved!",
+                    message=f"Your deposit of {amount} ETB (Tx: {transaction_id}) has been automatically verified and credited to your wallet balance.",
+                    event_type='DEPOSIT'
+                )
+
+            return True, "Verification successful! Your wallet balance has been updated.", deposit, result_data
+
+        elif result_data.get("verified") is False and (result_data.get("success") is True or http_status in (400, 404)):
+            # Rejection due to invalid Tx ID, mismatch, duplicate, or receipt not found
+            deposit.status = 'REJECTED'
+            deposit.reviewed_at = timezone.now()
+            raw_msg = result_data.get("message", "Payment verification failed for the selected bank.")
+            if http_status == 404 or "not found" in raw_msg.lower() or "unable to find" in raw_msg.lower():
+                rejection_msg = "Deposit rejected: Invalid payment/transaction ID for the selected bank. If you believe this rejection is a mistake, please contact support."
+            else:
+                rejection_msg = f"Deposit rejected: {raw_msg} If you believe this rejection is a mistake, please contact support."
+
+            deposit.admin_note = rejection_msg
+            deposit.save()
+
+            NotificationService.send_notification(
+                user=user,
+                title="❌ Verification Failed",
+                message=f"Deposit Tx {transaction_id} rejected: {rejection_msg}",
+                event_type='DEPOSIT'
+            )
+            return False, rejection_msg, deposit, result_data
+
+        else:
+            # Temporary error / receipt server offline -> keep PENDING for background verifier retry
+            deposit.status = 'PENDING'
+            deposit.admin_note = result_data.get("message", "Verification Pending Background Retry")
+            deposit.save()
+
+            NotificationService.send_notification(
+                user=user,
+                title="⏳ Verification In Progress",
+                message=f"Deposit Tx {transaction_id} recorded. The verification service will process it shortly.",
+                event_type='DEPOSIT'
+            )
+            return True, "Deposit recorded. Verification is processing in background.", deposit, result_data
 
     @staticmethod
     def approve_deposit(payment_id: int, admin_user: Optional[User] = None, admin_note: str = "Approved by Admin") -> Tuple[bool, str, Optional[PaymentSubmission]]:
@@ -147,9 +228,8 @@ class PaymentService:
             except PaymentSubmission.DoesNotExist:
                 return False, "Deposit submission not found.", None
 
-            # Strict Idempotency Check
-            if payment.status != 'PENDING':
-                return False, f"Deposit has already been processed with status: {payment.status}", payment
+            if payment.status == 'APPROVED':
+                return False, "Deposit is already approved.", payment
 
             payment.status = 'APPROVED'
             payment.reviewed_at = timezone.now()
@@ -167,25 +247,25 @@ class PaymentService:
                 status='COMPLETED',
                 amount=payment.amount,
                 reference_id=payment.transaction_id,
-                note=f"Approved Deposit via {payment.payment_method}",
+                note=f"Approved Deposit via {payment.payment_method} ({admin_note})",
                 related_deposit=payment
             )
 
             NotificationService.send_notification(
                 user=payment.user,
-                title="✅ Deposit Approved!",
+                title="✅ Deposit Approved by Admin!",
                 message=f"Your deposit of {payment.amount} ETB (Tx: {payment.transaction_id}) has been approved! Wallet balance updated.",
                 event_type='DEPOSIT'
             )
 
             AuditLog.objects.create(
                 actor=admin_user,
-                action="APPROVE_DEPOSIT",
+                action="MANUAL_APPROVE_DEPOSIT",
                 target_model="PaymentSubmission",
-                details=f"Approved deposit #{payment.id} (Tx: {payment.transaction_id}, Amount: {payment.amount} ETB) for user {payment.user.username}"
+                details=f"Manually approved deposit #{payment.id} (Tx: {payment.transaction_id}, Amount: {payment.amount} ETB) for user {payment.user.username}"
             )
 
-            return True, f"Deposit of {payment.amount} ETB approved and credited to {payment.user.username}.", payment
+            return True, f"Deposit of {payment.amount} ETB manually approved and credited to {payment.user.username}.", payment
 
     @staticmethod
     def reject_deposit(payment_id: int, admin_user: Optional[User] = None, admin_note: str = "Rejected by Admin") -> Tuple[bool, str, Optional[PaymentSubmission]]:
@@ -195,26 +275,42 @@ class PaymentService:
             except PaymentSubmission.DoesNotExist:
                 return False, "Deposit submission not found.", None
 
-            if payment.status != 'PENDING':
-                return False, f"Deposit has already been processed with status: {payment.status}", payment
+            was_approved = (payment.status == 'APPROVED')
 
             payment.status = 'REJECTED'
             payment.reviewed_at = timezone.now()
             payment.admin_note = admin_note
             payment.save()
 
+            # If it was previously approved, reverse the wallet credit
+            if was_approved:
+                wallet = WalletService.get_or_create_wallet(payment.user)
+                wallet.balance = max(Decimal('0.00'), wallet.balance - payment.amount)
+                wallet.save()
+
+                WalletTransaction.objects.create(
+                    wallet=wallet,
+                    transaction_type='DEPOSIT',
+                    direction='DEBIT',
+                    status='CANCELLED',
+                    amount=-payment.amount,
+                    reference_id=payment.transaction_id,
+                    note=f"Reversed Deposit (Admin Override: {admin_note})",
+                    related_deposit=payment
+                )
+
             NotificationService.send_notification(
                 user=payment.user,
                 title="❌ Deposit Rejected",
-                message=f"Your deposit request of {payment.amount} ETB (Tx: {payment.transaction_id}) was rejected. Reason: {admin_note}",
+                message=f"Your deposit request of {payment.amount} ETB (Tx: {payment.transaction_id}) was rejected by Admin. Reason: {admin_note}",
                 event_type='DEPOSIT'
             )
 
             AuditLog.objects.create(
                 actor=admin_user,
-                action="REJECT_DEPOSIT",
+                action="MANUAL_REJECT_DEPOSIT",
                 target_model="PaymentSubmission",
-                details=f"Rejected deposit #{payment.id} for user {payment.user.username}"
+                details=f"Manually rejected deposit #{payment.id} for user {payment.user.username}. Reason: {admin_note}"
             )
 
             return True, "Deposit submission rejected.", payment
@@ -344,7 +440,10 @@ class WithdrawalService:
             wallet.reserved_balance = max(Decimal('0.00'), wallet.reserved_balance - amount)
             wallet.save()
 
-            WalletTransaction.objects.filter(related_withdrawal=withdrawal).update(status='REJECTED')
+            WalletTransaction.objects.filter(related_withdrawal=withdrawal).update(
+                status='REJECTED',
+                note=f"Rejected Withdrawal to {withdrawal.withdrawal_method} (Funds Released)"
+            )
 
             NotificationService.send_notification(
                 user=withdrawal.user,

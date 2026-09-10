@@ -3,7 +3,7 @@ from django.contrib.auth.models import User
 from .models import (
     Category, UserProfile, SellerProfile, Product, Game, GameParticipant,
     GameResult, Favorite, Wallet, WalletTransaction, PaymentSubmission,
-    WithdrawalRequest, ProductDelivery, Notification, AuditLog
+    PaymentVerificationLog, WithdrawalRequest, ProductDelivery, Notification, AuditLog
 )
 
 class CategorySerializer(serializers.ModelSerializer):
@@ -111,8 +111,20 @@ class WalletSerializer(serializers.ModelSerializer):
         fields = ['id', 'user', 'username', 'balance', 'reserved_balance', 'available_balance', 'updated_at', 'transactions']
 
 
+class PaymentVerificationLogSerializer(serializers.ModelSerializer):
+    username = serializers.CharField(source='user.username', read_only=True)
+
+    class Meta:
+        model = PaymentVerificationLog
+        fields = '__all__'
+
+
 class PaymentSubmissionSerializer(serializers.ModelSerializer):
     username = serializers.CharField(source='user.username', read_only=True)
+    user_email = serializers.CharField(source='user.email', read_only=True)
+    user_phone = serializers.CharField(source='user.profile.phone_number', read_only=True)
+    wallet_balance = serializers.DecimalField(source='user.wallet.balance', max_digits=12, decimal_places=2, read_only=True)
+    verification_logs = PaymentVerificationLogSerializer(many=True, read_only=True)
 
     class Meta:
         model = PaymentSubmission
