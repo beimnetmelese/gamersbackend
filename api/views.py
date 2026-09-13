@@ -8,18 +8,22 @@ from rest_framework.authtoken.models import Token
 from django.contrib.auth import login, logout
 from django.contrib.auth.models import User
 from django.db import transaction
+from django.db.models import Sum, Count, Avg, Q
+from django.utils import timezone
 
 from .models import (
     Category, UserProfile, SellerProfile, Product, Game, GameParticipant,
     GameResult, Favorite, Wallet, WalletTransaction, PaymentSubmission,
-    WithdrawalRequest, ProductDelivery, Notification, AuditLog
+    WithdrawalRequest, ProductDelivery, Notification, AuditLog,
+    SellerRating, Report, PlatformSetting
 )
 from .serializers import (
     CategorySerializer, UserSerializer, UserProfileSerializer, SellerProfileSerializer,
     ProductSerializer, GameSerializer, GameParticipantSerializer, GameResultSerializer,
     FavoriteSerializer, WalletSerializer, WalletTransactionSerializer,
     PaymentSubmissionSerializer, WithdrawalRequestSerializer, ProductDeliverySerializer,
-    NotificationSerializer, AuditLogSerializer
+    NotificationSerializer, AuditLogSerializer,
+    SellerRatingSerializer, ReportSerializer, PlatformSettingSerializer
 )
 from .services import (
     WalletService, PaymentService, WithdrawalService,
@@ -168,6 +172,130 @@ class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
     permission_classes = [permissions.AllowAny]
+
+
+class ProductViewSet(viewsets.ModelViewSet):
+    serializer_class = ProductSerializer
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+
+    def get_queryset(self):
+        user = self.request.user
+        if is_user_admin(user):
+            return Product.objects.all().select_related('seller', 'seller__user').order_by('-created_at')
+
+        if self.request.query_params.get('my') == 'true' or self.action == 'my_products':
+            if user.is_authenticated and hasattr(user, 'seller_profile'):
+                return Product.objects.filter(seller=user.seller_profile).order_by('-created_at')
+            return Product.objects.none()
+
+        return Product.objects.filter(approval_status='APPROVED').select_related('seller').order_by('-created_at')
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        if not user.is_authenticated:
+            raise permissions.exceptions.NotAuthenticated("Authentication required to create products.")
+
+        if not hasattr(user, 'seller_profile'):
+            seller, _ = SellerProfile.objects.get_or_create(
+                user=user,
+                defaults={
+                    'business_name': f"{user.username}'s Store",
+                    'phone_number': getattr(getattr(user, 'profile', None), 'phone_number', '') or '+251900000000',
+                    'address': 'Addis Ababa',
+                    'status': 'PENDING'
+                }
+            )
+        else:
+            seller = user.seller_profile
+
+        product = serializer.save(seller=seller, approval_status='PENDING')
+
+        NotificationService.send_notification(
+            user=user,
+            title="📦 Product Submitted for Approval",
+            message=f"Product '{product.title}' has been submitted for Admin verification.",
+            event_type='SYSTEM'
+        )
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        instance = serializer.instance
+        if not is_user_admin(user) and instance.seller.user != user:
+            raise permissions.exceptions.PermissionDenied("You do not have permission to edit this product.")
+
+        if not is_user_admin(user):
+            serializer.save(approval_status='PENDING')
+        else:
+            serializer.save()
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if not is_user_admin(user) and instance.seller.user != user:
+            raise permissions.exceptions.PermissionDenied("You do not have permission to delete this product.")
+
+        if instance.games.filter(status__in=['ACTIVE', 'PENDING_APPROVAL']).exists():
+            raise permissions.exceptions.ValidationError("Cannot delete product while active or pending competitions exist for it.")
+
+        instance.delete()
+
+    @action(detail=False, methods=['get'], permission_classes=[permissions.IsAuthenticated])
+    def my_products(self, request):
+        if not hasattr(request.user, 'seller_profile'):
+            return Response([])
+        products = Product.objects.filter(seller=request.user.seller_profile).order_by('-created_at')
+        return Response(ProductSerializer(products, many=True).data)
+
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def approve(self, request, pk=None):
+        if not is_user_admin(request.user):
+            return Response({'error': 'Admin access required.'}, status=status.HTTP_403_FORBIDDEN)
+
+        product = self.get_object()
+        product.approval_status = 'APPROVED'
+        product.save()
+
+        NotificationService.send_notification(
+            user=product.seller.user,
+            title="✅ Product Approved!",
+            message=f"Your product '{product.title}' has been approved by admin and can now be used in competitions!",
+            event_type='SYSTEM'
+        )
+
+        AuditLog.objects.create(
+            actor=request.user,
+            action="APPROVE_PRODUCT",
+            target_model="Product",
+            details=f"Approved product #{product.id} ('{product.title}') for seller {product.seller.business_name}"
+        )
+
+        return Response({'message': f"Product '{product.title}' approved.", 'product': ProductSerializer(product).data})
+
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def reject(self, request, pk=None):
+        if not is_user_admin(request.user):
+            return Response({'error': 'Admin access required.'}, status=status.HTTP_403_FORBIDDEN)
+
+        product = self.get_object()
+        reason = request.data.get('reason', 'Product does not meet platform criteria.')
+        product.approval_status = 'REJECTED'
+        product.save()
+
+        NotificationService.send_notification(
+            user=product.seller.user,
+            title="❌ Product Rejected",
+            message=f"Your product '{product.title}' was rejected by admin. Reason: {reason}",
+            event_type='SYSTEM'
+        )
+
+        AuditLog.objects.create(
+            actor=request.user,
+            action="REJECT_PRODUCT",
+            target_model="Product",
+            details=f"Rejected product #{product.id} ('{product.title}'). Reason: {reason}"
+        )
+
+        return Response({'message': f"Product '{product.title}' rejected.", 'product': ProductSerializer(product).data})
+
 
 
 class UserProfileViewSet(viewsets.ModelViewSet):
@@ -486,6 +614,33 @@ class GameViewSet(viewsets.ModelViewSet):
     serializer_class = GameSerializer
     permission_classes = [permissions.AllowAny]
 
+    def perform_create(self, serializer):
+        user = self.request.user
+        seller = getattr(user, 'seller_profile', None)
+        if not seller and user.is_authenticated:
+            seller, _ = SellerProfile.objects.get_or_create(
+                user=user,
+                defaults={
+                    'business_name': f"{user.username}'s Store",
+                    'phone_number': getattr(getattr(user, 'profile', None), 'phone_number', '') or '+251900000000',
+                    'address': 'Addis Ababa',
+                    'status': 'PENDING'
+                }
+            )
+        prod = serializer.validated_data.get('product')
+        if prod and not is_user_admin(user) and seller and prod.seller != seller:
+            raise permissions.exceptions.PermissionDenied("You can only create competitions for products in your own inventory.")
+        serializer.save(seller=seller, status='PENDING_APPROVAL')
+
+    @action(detail=False, methods=['get'], permission_classes=[permissions.IsAuthenticated])
+    def seller_games(self, request):
+        user = request.user
+        seller = getattr(user, 'seller_profile', None)
+        if not seller:
+            return Response([])
+        games = Game.objects.filter(seller=seller).select_related('product', 'seller').order_by('-created_at')
+        return Response(GameSerializer(games, many=True, context={'request': request}).data)
+
     @action(detail=False, methods=['get'], permission_classes=[permissions.IsAuthenticated])
     def my_games(self, request):
         user = request.user
@@ -527,7 +682,7 @@ class GameViewSet(viewsets.ModelViewSet):
         pred_ans = request.data.get('prediction_answer')
         timer_delta = request.data.get('timer_delta_ms')
 
-        with db_transaction.atomic():
+        with transaction.atomic():
             wallet = Wallet.objects.select_for_update().get(user=user)
 
             if sel_box is not None and GameParticipant.objects.filter(game=game, selected_box=sel_box).exists():
@@ -612,7 +767,9 @@ class UserAdminViewSet(viewsets.ViewSet):
                 'account_status': prof.account_status if prof else ('ACTIVE' if u.is_active else 'SUSPENDED'),
                 'is_active': u.is_active,
                 'date_joined': u.date_joined,
-                'phone_number': prof.phone_number if prof else ''
+                'phone_number': prof.phone_number if prof else '',
+                'ban_reason': prof.ban_reason if prof else '',
+                'banned_at': prof.banned_at if prof else None,
             })
         return Response(data)
 
@@ -671,9 +828,278 @@ class UserAdminViewSet(viewsets.ViewSet):
 
         return Response({'message': f'User {target_user.username} role updated to {new_role}.'})
 
+    @action(detail=True, methods=['post'])
+    def ban(self, request, pk=None):
+        if not is_user_admin(request.user):
+            return Response({'error': 'Admin access required.'}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            target_user = User.objects.get(pk=pk)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if target_user == request.user:
+            return Response({'error': 'You cannot ban your own administrator account.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if target_user.is_superuser or (target_user.is_staff and not request.user.is_superuser):
+            return Response({'error': 'Cannot ban a staff administrator or superuser account.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        reason = request.data.get('reason', 'Violation of platform policies.')
+        profile, _ = UserProfile.objects.get_or_create(user=target_user)
+        profile.account_status = 'BANNED'
+        profile.ban_reason = reason
+        profile.banned_at = timezone.now()
+        profile.save()
+
+        target_user.is_active = False
+        target_user.save()
+
+        AuditLog.objects.create(
+            actor=request.user,
+            action="BAN_USER",
+            target_model="User",
+            details=f"Banned user {target_user.username}. Reason: {reason}"
+        )
+
+        NotificationService.send_notification(
+            user=target_user,
+            title="🚫 Account Banned",
+            message=f"Your account has been restricted by platform administration. Reason: {reason}",
+            event_type='SYSTEM'
+        )
+
+        return Response({'message': f'User {target_user.username} has been banned.', 'ban_reason': reason})
+
+    @action(detail=True, methods=['post'])
+    def unban(self, request, pk=None):
+        if not is_user_admin(request.user):
+            return Response({'error': 'Admin access required.'}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            target_user = User.objects.get(pk=pk)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        profile, _ = UserProfile.objects.get_or_create(user=target_user)
+        profile.account_status = 'ACTIVE'
+        profile.ban_reason = ''
+        profile.banned_at = None
+        profile.save()
+
+        target_user.is_active = True
+        target_user.save()
+
+        AuditLog.objects.create(
+            actor=request.user,
+            action="UNBAN_USER",
+            target_model="User",
+            details=f"Unbanned user {target_user.username}"
+        )
+
+        NotificationService.send_notification(
+            user=target_user,
+            title="✅ Account Unbanned",
+            message="Your account restriction has been lifted. You may now resume using the platform.",
+            event_type='SYSTEM'
+        )
+
+        return Response({'message': f'User {target_user.username} has been unbanned.'})
+
+    @action(detail=False, methods=['get'])
+    def analytics(self, request):
+        if not is_user_admin(request.user):
+            return Response({'error': 'Admin access required.'}, status=status.HTTP_403_FORBIDDEN)
+
+        total_users = User.objects.count()
+        active_users = User.objects.filter(is_active=True).count()
+        banned_users = UserProfile.objects.filter(account_status='BANNED').count()
+        verified_sellers = SellerProfile.objects.filter(status='VERIFIED').count()
+        pending_sellers = SellerProfile.objects.filter(status='PENDING').count()
+
+        total_games = Game.objects.count()
+        active_games = Game.objects.filter(status='ACTIVE').count()
+        completed_games = Game.objects.filter(status='COMPLETED').count()
+        pending_games = Game.objects.filter(status='PENDING_APPROVAL').count()
+
+        total_products = Product.objects.count()
+        approved_products = Product.objects.filter(approval_status='APPROVED').count()
+        pending_products = Product.objects.filter(approval_status='PENDING').count()
+        rejected_products = Product.objects.filter(approval_status='REJECTED').count()
+
+        total_deposits_val = PaymentSubmission.objects.filter(status='APPROVED').aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        pending_deposits_count = PaymentSubmission.objects.filter(status='PENDING').count()
+
+        total_withdrawals_val = WithdrawalRequest.objects.filter(status='APPROVED').aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        pending_withdrawals_count = WithdrawalRequest.objects.filter(status='PENDING').count()
+
+        total_entries = GameParticipant.objects.count()
+        platform_volume = GameParticipant.objects.aggregate(total=Sum('game__entry_fee'))['total'] or Decimal('0.00')
+
+        total_deliveries = ProductDelivery.objects.count()
+        pending_deliveries = ProductDelivery.objects.filter(status__in=['PREPARING', 'SHIPPED', 'OUT_FOR_DELIVERY']).count()
+        completed_deliveries = ProductDelivery.objects.filter(status__in=['DELIVERED', 'CONFIRMED']).count()
+
+        pending_reports = Report.objects.filter(status='PENDING').count()
+
+        return Response({
+            'users': {
+                'total': total_users,
+                'active': active_users,
+                'banned': banned_users,
+                'verified_sellers': verified_sellers,
+                'pending_sellers': pending_sellers,
+            },
+            'competitions': {
+                'total': total_games,
+                'active': active_games,
+                'completed': completed_games,
+                'pending_approval': pending_games,
+                'total_entries': total_entries,
+            },
+            'products': {
+                'total': total_products,
+                'approved': approved_products,
+                'pending': pending_products,
+                'rejected': rejected_products,
+            },
+            'financials': {
+                'total_deposits_etb': float(total_deposits_val),
+                'pending_deposits_count': pending_deposits_count,
+                'total_withdrawals_etb': float(total_withdrawals_val),
+                'pending_withdrawals_count': pending_withdrawals_count,
+                'platform_volume_etb': float(platform_volume),
+            },
+            'fulfillment': {
+                'total_deliveries': total_deliveries,
+                'pending_deliveries': pending_deliveries,
+                'completed_deliveries': completed_deliveries,
+            },
+            'moderation': {
+                'pending_reports': pending_reports,
+            }
+        })
+
 
 class SellerApplicationViewSet(viewsets.ViewSet):
     permission_classes = [permissions.IsAuthenticated]
+
+    @action(detail=False, methods=['get', 'patch'])
+    def me(self, request):
+        user = request.user
+        seller = getattr(user, 'seller_profile', None)
+        if not seller:
+            return Response({'error': 'Seller profile not found. Please register as a seller first.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if request.method == 'PATCH':
+            b_name = request.data.get('business_name')
+            phone = request.data.get('phone_number')
+            address = request.data.get('address')
+            desc = request.data.get('description')
+            if b_name is not None and b_name.strip(): seller.business_name = b_name.strip()
+            if phone is not None and phone.strip(): seller.phone_number = phone.strip()
+            if address is not None and address.strip(): seller.address = address.strip()
+            if desc is not None: seller.description = desc.strip()
+            seller.save()
+
+        return Response(SellerProfileSerializer(seller).data)
+
+    @action(detail=False, methods=['get'])
+    def stats(self, request):
+        user = request.user
+        seller = getattr(user, 'seller_profile', None)
+        if not seller:
+            return Response({
+                'total_products': 0,
+                'active_products': 0,
+                'total_games': 0,
+                'active_games': 0,
+                'completed_games': 0,
+                'total_revenue_etb': 0.0,
+                'pending_deliveries': 0,
+                'completed_deliveries': 0,
+                'average_rating': 0.0,
+                'rating_count': 0,
+                'wallet_balance': 0.0,
+            })
+
+        total_prods = Product.objects.filter(seller=seller).count()
+        active_prods = Product.objects.filter(seller=seller, approval_status='APPROVED').count()
+
+        games_qs = Game.objects.filter(seller=seller)
+        total_games = games_qs.count()
+        active_games = games_qs.filter(status='ACTIVE').count()
+        completed_games = games_qs.filter(status='COMPLETED').count()
+
+        total_rev = GameParticipant.objects.filter(game__seller=seller).aggregate(total=Sum('game__entry_fee'))['total'] or Decimal('0.00')
+
+        pending_del = ProductDelivery.objects.filter(seller=seller, status__in=['PREPARING', 'SHIPPED', 'OUT_FOR_DELIVERY']).count()
+        completed_del = ProductDelivery.objects.filter(seller=seller, status__in=['DELIVERED', 'CONFIRMED']).count()
+
+        rating_agg = SellerRating.objects.filter(seller=seller).aggregate(avg=Avg('rating'), count=Count('id'))
+        avg_rating = round(float(rating_agg['avg'] or 0.0), 1)
+        rating_count = rating_agg['count'] or 0
+
+        wallet = getattr(user, 'wallet', None)
+        wallet_bal = float(wallet.balance) if wallet else 0.0
+
+        return Response({
+            'total_products': total_prods,
+            'active_products': active_prods,
+            'total_games': total_games,
+            'active_games': active_games,
+            'completed_games': completed_games,
+            'total_revenue_etb': float(total_rev),
+            'pending_deliveries': pending_del,
+            'completed_deliveries': completed_del,
+            'average_rating': avg_rating,
+            'rating_count': rating_count,
+            'wallet_balance': wallet_bal,
+        })
+
+    @action(detail=False, methods=['get'])
+    def analytics(self, request):
+        user = request.user
+        seller = getattr(user, 'seller_profile', None)
+        if not seller:
+            return Response({'error': 'Seller profile not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Games breakdown
+        games = Game.objects.filter(seller=seller).select_related('product').order_by('-created_at')[:20]
+        games_data = []
+        for g in games:
+            part_count = g.participants.count()
+            collected = float(g.entry_fee * part_count)
+            games_data.append({
+                'id': g.id,
+                'title': g.title,
+                'product_title': g.product.title if g.product else '',
+                'status': g.status,
+                'participants_count': part_count,
+                'max_participants': g.max_participants,
+                'collected_etb': collected,
+                'created_at': g.created_at,
+            })
+
+        # Rating breakdown
+        ratings = SellerRating.objects.filter(seller=seller).select_related('user')
+        breakdown = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+        recent_reviews = []
+        for r in ratings:
+            breakdown[r.rating] = breakdown.get(r.rating, 0) + 1
+            if len(recent_reviews) < 10:
+                recent_reviews.append({
+                    'id': r.id,
+                    'username': r.user.username,
+                    'rating': r.rating,
+                    'review': r.review,
+                    'created_at': r.created_at,
+                })
+
+        return Response({
+            'games_performance': games_data,
+            'ratings_breakdown': breakdown,
+            'recent_reviews': recent_reviews,
+        })
 
     @action(detail=False, methods=['post'])
     def apply(self, request):
@@ -736,7 +1162,6 @@ class SellerApplicationViewSet(viewsets.ViewSet):
             return Response({'error': 'Seller request not found.'}, status=status.HTTP_404_NOT_FOUND)
 
         seller.status = 'VERIFIED'
-        from django.utils import timezone
         seller.verified_at = timezone.now()
         seller.save()
 
@@ -789,4 +1214,257 @@ class SellerApplicationViewSet(viewsets.ViewSet):
         )
 
         return Response({'message': 'Seller application rejected.'})
+
+
+class ProductDeliveryViewSet(viewsets.ModelViewSet):
+    serializer_class = ProductDeliverySerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        if is_user_admin(user):
+            return ProductDelivery.objects.all().select_related(
+                'game_result__game', 'game_result__game__product', 'winner', 'seller'
+            ).order_by('-created_at')
+
+        seller = getattr(user, 'seller_profile', None)
+        if seller:
+            return ProductDelivery.objects.filter(Q(seller=seller) | Q(winner=user)).select_related(
+                'game_result__game', 'game_result__game__product', 'winner', 'seller'
+            ).order_by('-created_at')
+
+        return ProductDelivery.objects.filter(winner=user).select_related(
+            'game_result__game', 'game_result__game__product', 'winner', 'seller'
+        ).order_by('-created_at')
+
+    @action(detail=True, methods=['post'])
+    def update_status(self, request, pk=None):
+        delivery = self.get_object()
+        user = request.user
+        is_admin = is_user_admin(user)
+        is_seller = (delivery.seller.user == user)
+        is_winner = (delivery.winner == user)
+
+        new_status = request.data.get('status')
+        valid_statuses = [c[0] for c in ProductDelivery.STATUS_CHOICES]
+        if new_status and new_status not in valid_statuses:
+            return Response({'error': f'Invalid status. Must be one of {valid_statuses}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Winner can confirm delivery receipt
+        if is_winner and not (is_admin or is_seller):
+            if new_status != 'CONFIRMED':
+                return Response({'error': 'Winners can only confirm receipt of delivered packages.'}, status=status.HTTP_403_FORBIDDEN)
+            if delivery.status != 'DELIVERED':
+                return Response({'error': 'Cannot confirm receipt before package is marked as delivered.'}, status=status.HTTP_400_BAD_REQUEST)
+        elif not (is_admin or is_seller):
+            return Response({'error': 'Only the seller, winner, or admin can update delivery tracking status.'}, status=status.HTTP_403_FORBIDDEN)
+
+        # Seller cannot confirm receipt on winner's behalf
+        if is_seller and not is_admin and new_status == 'CONFIRMED':
+            return Response({'error': 'Only the recipient winner can confirm delivery receipt.'}, status=status.HTTP_403_FORBIDDEN)
+
+        # Seller cannot revert status backwards
+        status_order = {'PREPARING': 1, 'SHIPPED': 2, 'OUT_FOR_DELIVERY': 3, 'DELIVERED': 4, 'CONFIRMED': 5}
+        if is_seller and not is_admin and new_status:
+            current_rank = status_order.get(delivery.status, 0)
+            new_rank = status_order.get(new_status, 0)
+            if new_rank < current_rank:
+                return Response({'error': f'Cannot revert status backwards from {delivery.status} to {new_status}.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if new_status:
+            delivery.status = new_status
+
+        tracking = request.data.get('tracking_code')
+        if tracking is not None:
+            delivery.tracking_code = tracking.strip()
+
+        delivery.save()
+
+        status_messages = {
+            'PREPARING': 'Your competition prize package is being prepared for dispatch.',
+            'SHIPPED': f"Your prize has been shipped! Tracking code: {delivery.tracking_code or 'N/A'}",
+            'OUT_FOR_DELIVERY': 'Your prize package is out for delivery today!',
+            'DELIVERED': 'Your prize has been delivered. Please confirm receipt!',
+            'CONFIRMED': 'Delivery successfully confirmed by recipient.',
+        }
+
+        NotificationService.send_notification(
+            user=delivery.winner,
+            title=f"📦 Delivery Update: {delivery.get_status_display()}",
+            message=status_messages.get(delivery.status, f"Delivery status changed to {delivery.status}."),
+            event_type='SYSTEM'
+        )
+
+        AuditLog.objects.create(
+            actor=user,
+            action="UPDATE_DELIVERY_STATUS",
+            target_model="ProductDelivery",
+            details=f"Updated Delivery #{delivery.id} status to {delivery.status}, tracking: {delivery.tracking_code}"
+        )
+
+        return Response({'message': 'Delivery updated successfully.', 'delivery': ProductDeliverySerializer(delivery).data})
+
+    @action(detail=True, methods=['post'])
+    def update_address(self, request, pk=None):
+        delivery = self.get_object()
+        user = request.user
+        if delivery.winner != user and not is_user_admin(user):
+            return Response({'error': 'Only the winner can update the shipping address.'}, status=status.HTTP_403_FORBIDDEN)
+
+        if delivery.status in ['DELIVERED', 'CONFIRMED']:
+            return Response({'error': 'Cannot change address on delivered packages.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        address = request.data.get('delivery_address')
+        phone = request.data.get('phone_number')
+
+        if address: delivery.delivery_address = address.strip()
+        if phone: delivery.phone_number = phone.strip()
+        delivery.save()
+
+        return Response({'message': 'Address updated.', 'delivery': ProductDeliverySerializer(delivery).data})
+
+
+class SellerRatingViewSet(viewsets.ModelViewSet):
+    serializer_class = SellerRatingSerializer
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+
+    def get_queryset(self):
+        seller_id = self.request.query_params.get('seller_id')
+        if seller_id:
+            return SellerRating.objects.filter(seller_id=seller_id).select_related('user', 'seller')
+        return SellerRating.objects.all().select_related('user', 'seller')
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        seller_id = self.request.data.get('seller')
+        try:
+            seller = SellerProfile.objects.get(pk=seller_id)
+        except SellerProfile.DoesNotExist:
+            raise permissions.exceptions.ValidationError({'error': 'Seller not found.'})
+
+        if seller.user == user:
+            raise permissions.exceptions.ValidationError({'error': 'Sellers cannot rate their own store.'})
+
+        game_id = self.request.data.get('game')
+        game = Game.objects.filter(pk=game_id).first() if game_id else None
+
+        serializer.save(user=user, seller=seller, game=game)
+
+
+class ReportViewSet(viewsets.ModelViewSet):
+    serializer_class = ReportSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        if is_user_admin(user):
+            return Report.objects.all().select_related('reporter', 'moderator').order_by('-created_at')
+        return Report.objects.filter(reporter=user).order_by('-created_at')
+
+    def perform_create(self, serializer):
+        serializer.save(reporter=self.request.user, status='PENDING')
+
+    @action(detail=True, methods=['post'])
+    def resolve(self, request, pk=None):
+        if not is_user_admin(request.user):
+            return Response({'error': 'Admin access required.'}, status=status.HTTP_403_FORBIDDEN)
+
+        report = self.get_object()
+        resolution_note = request.data.get('resolution_note', 'Resolved by platform moderator.')
+        new_status = request.data.get('status', 'RESOLVED')
+        action_taken = request.data.get('action_taken', 'NO_ACTION')
+
+        report.status = new_status
+        report.moderator = request.user
+        report.resolution_note = resolution_note
+        report.resolved_at = timezone.now()
+        report.save()
+
+        if action_taken == 'BAN_USER':
+            target_user = None
+            if report.target_type == 'USER':
+                target_user = User.objects.filter(pk=report.target_id).first()
+            elif report.target_type == 'SELLER':
+                sp = SellerProfile.objects.filter(pk=report.target_id).first()
+                if sp: target_user = sp.user
+
+            if target_user:
+                target_user.is_active = False
+                target_user.save()
+                prof, _ = UserProfile.objects.get_or_create(user=target_user)
+                prof.account_status = 'BANNED'
+                prof.ban_reason = f"Banned via Report #{report.id}: {resolution_note}"
+                prof.banned_at = timezone.now()
+                prof.save()
+
+        AuditLog.objects.create(
+            actor=request.user,
+            action="RESOLVE_REPORT",
+            target_model="Report",
+            details=f"Resolved Report #{report.id} ({report.target_type}) - Action: {action_taken}"
+        )
+
+        return Response({'message': f'Report #{report.id} has been {new_status.lower()}.', 'report': ReportSerializer(report).data})
+
+
+class PlatformSettingViewSet(viewsets.ViewSet):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def list(self, request):
+        settings = PlatformSetting.objects.all()
+        if not settings.exists():
+            default_settings = [
+                ('PLATFORM_COMMISSION_PERCENT', '5.0', 'Platform commission taken from game pools (%)'),
+                ('MIN_WITHDRAWAL_ETB', '100.0', 'Minimum withdrawal amount in ETB'),
+                ('MAX_WITHDRAWAL_ETB', '50000.0', 'Maximum daily withdrawal amount in ETB'),
+                ('MIN_DEPOSIT_ETB', '50.0', 'Minimum deposit allowed in ETB'),
+                ('AUTO_APPROVE_VERIFIED_SELLERS_PRODUCTS', 'false', 'Automatically approve products added by verified sellers'),
+                ('MAINTENANCE_MODE', 'false', 'Put platform into maintenance mode'),
+                ('SUPPORT_PHONE', '+251 900 123 456', 'Customer support hotline phone number'),
+                ('SUPPORT_EMAIL', 'support@gamersplatform.et', 'Customer support official email'),
+            ]
+            for key, val, desc in default_settings:
+                PlatformSetting.objects.get_or_create(key=key, defaults={'value': val, 'description': desc})
+            settings = PlatformSetting.objects.all()
+
+        return Response(PlatformSettingSerializer(settings, many=True).data)
+
+    @action(detail=False, methods=['post'])
+    def update_settings(self, request):
+        if not is_user_admin(request.user):
+            return Response({'error': 'Admin access required.'}, status=status.HTTP_403_FORBIDDEN)
+
+        items = request.data.get('settings', request.data)
+        if isinstance(items, str):
+            import json
+            try:
+                items = json.loads(items)
+            except Exception:
+                pass
+
+        if isinstance(items, dict):
+            for k, v in items.items():
+                if k != 'settings':
+                    PlatformSetting.objects.update_or_create(key=k, defaults={'value': str(v)})
+        elif isinstance(items, list):
+            for item in items:
+                k = item.get('key')
+                v = item.get('value')
+                desc = item.get('description', '')
+                if k is not None and v is not None:
+                    obj, _ = PlatformSetting.objects.update_or_create(key=k, defaults={'value': str(v)})
+                    if desc:
+                        obj.description = desc
+                        obj.save()
+
+        AuditLog.objects.create(
+            actor=request.user,
+            action="UPDATE_PLATFORM_SETTINGS",
+            target_model="PlatformSetting",
+            details=f"Admin {request.user.username} updated platform settings."
+        )
+
+        all_settings = PlatformSetting.objects.all()
+        return Response({'message': 'Settings updated successfully.', 'settings': PlatformSettingSerializer(all_settings, many=True).data})
+
 

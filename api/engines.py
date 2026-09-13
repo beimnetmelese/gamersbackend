@@ -1,7 +1,7 @@
 import random
 from collections import Counter
 from typing import Optional, Tuple
-from .models import Game, GameParticipant, GameResult
+from .models import Game, GameParticipant, GameResult, ProductDelivery
 
 CARD_RANKS = {
     'A': 14, 'K': 13, 'Q': 12, 'J': 11,
@@ -144,4 +144,24 @@ def resolve_game_winner(game: Game) -> Tuple[Optional[GameResult], str]:
     game.status = 'COMPLETED'
     game.save()
 
+    # Automatically and idempotently create ProductDelivery for physical fulfillment
+    if winner_user and hasattr(game, 'seller') and game.seller:
+        try:
+            profile = getattr(winner_user, 'profile', None)
+            delivery_addr = profile.bio if profile and profile.bio else 'Address to be confirmed by winner'
+            phone = profile.phone_number if profile and profile.phone_number else '+251900000000'
+            ProductDelivery.objects.get_or_create(
+                game_result=result,
+                defaults={
+                    'winner': winner_user,
+                    'seller': game.seller,
+                    'delivery_address': delivery_addr,
+                    'phone_number': phone,
+                    'status': 'PREPARING'
+                }
+            )
+        except Exception:
+            pass
+
     return result, notes
+

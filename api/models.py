@@ -37,6 +37,8 @@ class UserProfile(models.Model):
     privacy_settings = models.JSONField(default=dict, blank=True, help_text="Profile visibility and activity settings")
     language = models.CharField(max_length=10, default='en')
     telegram_chat_id = models.CharField(max_length=100, blank=True, default='', help_text="Optional Telegram Chat ID for notification mirroring")
+    ban_reason = models.TextField(blank=True, default='', help_text="Reason for suspension or ban")
+    banned_at = models.DateTimeField(null=True, blank=True)
     
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -81,7 +83,7 @@ class Product(models.Model):
     title = models.CharField(max_length=200)
     category = models.CharField(max_length=100, default='Electronics')
     description = models.TextField()
-    image_url = models.URLField(blank=True, default='')
+    image_url = models.TextField(blank=True, default='')
     condition = models.CharField(max_length=30, choices=CONDITION_CHOICES, default='NEW')
     estimated_value = models.DecimalField(max_digits=12, decimal_places=2)
     location = models.CharField(max_length=100, default='Addis Ababa')
@@ -395,3 +397,78 @@ class AuditLog(models.Model):
 
     def __str__(self):
         return f"Audit: {self.action} by {self.actor.username if self.actor else 'System'}"
+
+
+class SellerRating(models.Model):
+    seller = models.ForeignKey(SellerProfile, on_delete=models.CASCADE, related_name='ratings')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='seller_ratings')
+    game = models.ForeignKey(Game, on_delete=models.SET_NULL, null=True, blank=True, related_name='seller_ratings')
+    rating = models.PositiveSmallIntegerField(default=5)
+    review = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        unique_together = [('seller', 'user', 'game')]
+
+    def __str__(self):
+        return f"{self.user.username} rated {self.seller.business_name}: {self.rating}★"
+
+
+class Report(models.Model):
+    TARGET_TYPE_CHOICES = [
+        ('USER', 'User'),
+        ('SELLER', 'Seller'),
+        ('GAME', 'Game'),
+        ('PRODUCT', 'Product'),
+    ]
+    CATEGORY_CHOICES = [
+        ('SCAM', 'Fraud or Scam'),
+        ('MISLEADING', 'Misleading Details'),
+        ('INAPPROPRIATE', 'Inappropriate Content'),
+        ('NON_DELIVERY', 'Non-Delivery of Product'),
+        ('OTHER', 'Other'),
+    ]
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending Review'),
+        ('INVESTIGATING', 'Under Investigation'),
+        ('RESOLVED', 'Resolved'),
+        ('DISMISSED', 'Dismissed'),
+    ]
+
+    reporter = models.ForeignKey(User, on_delete=models.CASCADE, related_name='filed_reports')
+    target_type = models.CharField(max_length=30, choices=TARGET_TYPE_CHOICES)
+    target_id = models.PositiveIntegerField()
+    target_label = models.CharField(max_length=200, blank=True, default='')
+    category = models.CharField(max_length=50, choices=CATEGORY_CHOICES, default='OTHER')
+    reason = models.TextField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+    moderator = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='resolved_reports')
+    resolution_note = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Report #{self.id} [{self.target_type}] by {self.reporter.username} - {self.status}"
+
+
+class PlatformSetting(models.Model):
+    key = models.CharField(max_length=100, unique=True)
+    value = models.TextField()
+    description = models.CharField(max_length=255, blank=True, default='')
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['key']
+
+    def __str__(self):
+        return f"{self.key} = {self.value}"
+
+    @classmethod
+    def get_setting(cls, key: str, default: str = "") -> str:
+        obj = cls.objects.filter(key=key).first()
+        return obj.value if obj else default
+

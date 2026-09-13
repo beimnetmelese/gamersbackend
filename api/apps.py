@@ -15,10 +15,4 @@ class ApiConfig(AppConfig):
 
     def ready(self):
         post_migrate.connect(seed_admin_accounts_signal, sender=self)
-        if 'runserver' in sys.argv or 'migrate' in sys.argv:
-            try:
-                from django.core.management import call_command
-                call_command('setup_admin_accounts')
-            except Exception:
-                pass
 

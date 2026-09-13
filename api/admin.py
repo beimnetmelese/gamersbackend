@@ -2,7 +2,8 @@ from django.contrib import admin
 from .models import (
     UserProfile, SellerProfile, Product, Game, GameParticipant,
     GameResult, Favorite, Wallet, WalletTransaction, PaymentSubmission,
-    WithdrawalRequest, ProductDelivery, Notification, AuditLog
+    WithdrawalRequest, ProductDelivery, Notification, AuditLog,
+    SellerRating, Report, PlatformSetting
 )
 
 @admin.register(UserProfile)
@@ -68,3 +69,18 @@ class NotificationAdmin(admin.ModelAdmin):
 @admin.register(AuditLog)
 class AuditLogAdmin(admin.ModelAdmin):
     list_display = ['actor', 'action', 'target_model', 'timestamp']
+
+@admin.register(SellerRating)
+class SellerRatingAdmin(admin.ModelAdmin):
+    list_display = ['seller', 'user', 'rating', 'created_at']
+    list_filter = ['rating']
+
+@admin.register(Report)
+class ReportAdmin(admin.ModelAdmin):
+    list_display = ['id', 'target_type', 'target_label', 'category', 'status', 'reporter', 'created_at']
+    list_filter = ['status', 'category', 'target_type']
+
+@admin.register(PlatformSetting)
+class PlatformSettingAdmin(admin.ModelAdmin):
+    list_display = ['key', 'value', 'description', 'updated_at']
+

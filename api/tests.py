@@ -112,6 +112,7 @@ class FinancialAndServicesTests(TestCase):
 
     def test_deposit_and_idempotent_approval(self):
         from unittest.mock import patch
+        import api.verification_service
         with patch('api.verification_service.PaymentVerificationService.verify_payment') as mock_verify:
             mock_verify.return_value = ({
                 "success": False,
@@ -220,4 +221,145 @@ class FinancialAndServicesTests(TestCase):
         auth3 = AuthService.authenticate_user("cAsEuSeR", "MySecretPassword123")
         self.assertIsNotNone(auth3)
         self.assertEqual(auth3, u)
-        self.assertEqual(auth3, u)
+
+
+class Developer3DomainTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_user(username="admin_biruk", password="password123", is_staff=True)
+        UserProfile.objects.create(user=self.admin, role="ADMIN")
+
+        self.seller_user = User.objects.create_user(username="seller_abebe", password="password123")
+        self.seller_prof = SellerProfile.objects.create(
+            user=self.seller_user,
+            business_name="Abebe Electronics",
+            phone_number="+251912345678",
+            address="Merkato, Addis Ababa",
+            status="VERIFIED"
+        )
+        UserProfile.objects.create(user=self.seller_user, role="SELLER")
+
+        self.buyer_user = User.objects.create_user(username="buyer_kebede", password="password123")
+        UserProfile.objects.create(user=self.buyer_user, role="USER")
+        WalletService.get_or_create_wallet(self.buyer_user)
+
+    def test_product_lifecycle_and_approval(self):
+        from .models import Product
+        prod = Product.objects.create(
+            seller=self.seller_prof,
+            title="Sony PlayStation 5",
+            category="Gaming",
+            description="Next-gen console",
+            estimated_value=Decimal("65000.00"),
+            approval_status="PENDING"
+        )
+        self.assertEqual(prod.approval_status, "PENDING")
+
+        # Admin approves
+        prod.approval_status = "APPROVED"
+        prod.save()
+        self.assertEqual(prod.approval_status, "APPROVED")
+
+    def test_game_resolution_creates_delivery_automatically(self):
+        from .models import Product, Game, GameParticipant, ProductDelivery
+        from .engines import resolve_game_winner
+
+        prod = Product.objects.create(
+            seller=self.seller_prof,
+            title="Galaxy S24 Ultra",
+            category="Phones",
+            description="Flagship smartphone",
+            estimated_value=Decimal("95000.00"),
+            approval_status="APPROVED"
+        )
+        game = Game.objects.create(
+            product=prod,
+            seller=self.seller_prof,
+            title="S24 Ultra Treasure Hunt",
+            game_type="TREASURE_BOX",
+            entry_fee=Decimal("150.00"),
+            status="ACTIVE"
+        )
+        GameParticipant.objects.create(game=game, user=self.buyer_user, selected_box=7)
+
+        result, msg = resolve_game_winner(game)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.winner, self.buyer_user)
+
+        # Verify ProductDelivery was automatically created!
+        delivery = ProductDelivery.objects.filter(game_result=result).first()
+        self.assertIsNotNone(delivery)
+        self.assertEqual(delivery.winner, self.buyer_user)
+        self.assertEqual(delivery.seller, self.seller_prof)
+        self.assertEqual(delivery.status, "PREPARING")
+
+    def test_ban_and_unban_user_flow(self):
+        from rest_framework.test import APIClient
+        client = APIClient()
+        client.force_authenticate(user=self.admin)
+
+        # Ban buyer
+        response = client.post(f"/api/users/{self.buyer_user.id}/ban/", {"reason": "Terms violation"})
+        self.assertEqual(response.status_code, 200)
+
+        self.buyer_user.refresh_from_db()
+        self.assertFalse(self.buyer_user.is_active)
+        self.assertEqual(self.buyer_user.profile.account_status, "BANNED")
+        self.assertEqual(self.buyer_user.profile.ban_reason, "Terms violation")
+
+        # Unban buyer
+        unban_resp = client.post(f"/api/users/{self.buyer_user.id}/unban/")
+        self.assertEqual(unban_resp.status_code, 200)
+
+        self.buyer_user.refresh_from_db()
+        self.assertTrue(self.buyer_user.is_active)
+        self.assertEqual(self.buyer_user.profile.account_status, "ACTIVE")
+        self.assertEqual(self.buyer_user.profile.ban_reason, "")
+
+    def test_platform_settings_endpoint(self):
+        from rest_framework.test import APIClient
+        client = APIClient()
+        client.force_authenticate(user=self.admin)
+
+        # Fetch list (auto-seeds defaults)
+        list_resp = client.get("/api/settings/")
+        self.assertEqual(list_resp.status_code, 200)
+        self.assertTrue(len(list_resp.data) >= 8)
+
+        # Update commission
+        update_resp = client.post("/api/settings/update_settings/", {
+            "settings": [{"key": "PLATFORM_COMMISSION_PERCENT", "value": "7.5"}]
+        }, format='json')
+        self.assertEqual(update_resp.status_code, 200)
+
+        from .models import PlatformSetting
+        self.assertEqual(PlatformSetting.get_setting("PLATFORM_COMMISSION_PERCENT"), "7.5")
+
+    def test_reports_and_moderator_resolution(self):
+        from rest_framework.test import APIClient
+        from .models import Report
+        client = APIClient()
+
+        # Buyer files report against seller
+        client.force_authenticate(user=self.buyer_user)
+        create_resp = client.post("/api/reports/", {
+            "target_type": "SELLER",
+            "target_id": self.seller_prof.id,
+            "target_label": self.seller_prof.business_name,
+            "category": "MISLEADING",
+            "reason": "Product details inaccurate"
+        })
+        self.assertEqual(create_resp.status_code, 201)
+        report_id = create_resp.data["id"]
+
+        # Admin resolves report and issues warning
+        client.force_authenticate(user=self.admin)
+        resolve_resp = client.post(f"/api/reports/{report_id}/resolve/", {
+            "status": "RESOLVED",
+            "resolution_note": "Seller warned to update description",
+            "action_taken": "WARNING_ISSUED"
+        })
+        self.assertEqual(resolve_resp.status_code, 200)
+        report = Report.objects.get(pk=report_id)
+        self.assertEqual(report.status, "RESOLVED")
+        self.assertEqual(report.moderator, self.admin)
+

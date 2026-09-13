@@ -3,8 +3,9 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     register_user, login_user, logout_user, change_password, get_user_stats,
     UserProfileViewSet, FavoriteViewSet, NotificationViewSet,
-    CategoryViewSet, GameViewSet, WalletViewSet, PaymentSubmissionViewSet,
-    WithdrawalRequestViewSet, UserAdminViewSet, SellerApplicationViewSet
+    CategoryViewSet, ProductViewSet, GameViewSet, WalletViewSet, PaymentSubmissionViewSet,
+    WithdrawalRequestViewSet, UserAdminViewSet, SellerApplicationViewSet,
+    ProductDeliveryViewSet, SellerRatingViewSet, ReportViewSet, PlatformSettingViewSet
 )
 
 router = DefaultRouter()
@@ -12,10 +13,15 @@ router.register(r'profiles', UserProfileViewSet, basename='userprofile')
 router.register(r'favorites', FavoriteViewSet, basename='favorite')
 router.register(r'notifications', NotificationViewSet, basename='notification')
 router.register(r'categories', CategoryViewSet, basename='category')
+router.register(r'products', ProductViewSet, basename='product')
 router.register(r'games', GameViewSet, basename='game')
 router.register(r'wallets', WalletViewSet, basename='wallet')
 router.register(r'payments', PaymentSubmissionViewSet, basename='payment')
 router.register(r'withdrawals', WithdrawalRequestViewSet, basename='withdrawal')
+router.register(r'deliveries', ProductDeliveryViewSet, basename='delivery')
+router.register(r'ratings', SellerRatingViewSet, basename='rating')
+router.register(r'reports', ReportViewSet, basename='report')
+router.register(r'settings', PlatformSettingViewSet, basename='platformsetting')
 router.register(r'users', UserAdminViewSet, basename='useradmin')
 router.register(r'sellers', SellerApplicationViewSet, basename='sellerapp')
 
