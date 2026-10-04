@@ -26,10 +26,36 @@ DEBUG = os.environ.get('DEBUG', 'True').lower() in ('true', '1', 'yes')
 
 ALLOWED_HOSTS = [h.strip() for h in os.environ.get('ALLOWED_HOSTS', '*').split(',') if h.strip()]
 
-# Telegram Bot Configuration
+# Operating Environment Mode: 'test' vs 'live'
+APP_MODE = os.environ.get('APP_MODE', 'test').strip().lower()
+
+# Telegram Bot & Web App Configuration
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_ADMIN_CHAT_ID = os.environ.get('TELEGRAM_ADMIN_CHAT_ID', '')
 TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'AddisGigsGameBot')
+
+# Multi-Admin Support via Telegram User IDs
+RAW_ADMIN_IDS = os.environ.get('TELEGRAM_ADMIN_IDS', os.environ.get('TELEGRAM_ADMIN_CHAT_ID', '1166925225'))
+TELEGRAM_ADMIN_IDS = [x.strip() for x in RAW_ADMIN_IDS.replace(';', ',').split(',') if x.strip()]
+
+# Telegram Web App Request Verification Toggle
+# In 'test' mode, strict Telegram initData HMAC verification is bypassed for local browser sandbox testing.
+# In 'live' mode, strict HMAC verification is enforced.
+if 'TELEGRAM_VERIFY_REQUESTS' in os.environ:
+    TELEGRAM_VERIFY_REQUESTS = os.environ.get('TELEGRAM_VERIFY_REQUESTS', 'True').lower() in ('true', '1', 'yes')
+else:
+    TELEGRAM_VERIFY_REQUESTS = (APP_MODE == 'live')
+
+# Telegram Web App Frontend URL
+TELEGRAM_WEB_APP_URL = os.environ.get('TELEGRAM_WEB_APP_URL', 'http://localhost:5173')
+
+# Payment Accounts Configuration
+PAYMENT_TELEBIRR_ACCOUNT = os.environ.get('PAYMENT_TELEBIRR_ACCOUNT', '0911223344')
+PAYMENT_CBE_ACCOUNT = os.environ.get('PAYMENT_CBE_ACCOUNT', '1000123456789')
+PAYMENT_ACCOUNT_NAME = os.environ.get('PAYMENT_ACCOUNT_NAME', os.environ.get('PAYMENT_CBE_ACCOUNT_NAME', 'Beiment Melese'))
+PAYMENT_CBE_ACCOUNT_NAME = os.environ.get('PAYMENT_CBE_ACCOUNT_NAME', 'Beiment Melese')
+PAYMENT_TELEBIRR_ACCOUNT_NAME = os.environ.get('PAYMENT_TELEBIRR_ACCOUNT_NAME', 'Beiment Melese')
+
 
 # Application definition
 INSTALLED_APPS = [

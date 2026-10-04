@@ -11,18 +11,24 @@ from .scraper import (
     CBEParseException
 )
 
+from django.conf import settings
+
 logger = logging.getLogger(__name__)
 
-EXPECTED_RECEIVER_NAME = "Beimnet Melese Kebede"
+EXPECTED_RECEIVER_NAME = getattr(settings, 'PAYMENT_ACCOUNT_NAME', 'Beiment Melese')
 
 
-def is_receiver_verified(actual_receiver: str, expected_receiver: str = EXPECTED_RECEIVER_NAME) -> bool:
+def is_receiver_verified(actual_receiver: str, expected_receiver: str = None) -> bool:
     """
     Check if the receipt's receiver / credited party name matches expected receiver name.
     Ignores case, normalizes whitespace, and supports token-based matching.
     """
+    if expected_receiver is None:
+        expected_receiver = getattr(settings, 'PAYMENT_ACCOUNT_NAME', 'Beiment Melese')
+
     if not actual_receiver:
         return False
+
     clean_actual = ' '.join(str(actual_receiver).split()).lower()
     clean_expected = ' '.join(str(expected_receiver).split()).lower()
 
@@ -31,6 +37,10 @@ def is_receiver_verified(actual_receiver: str, expected_receiver: str = EXPECTED
 
     expected_words = [w for w in clean_expected.split() if len(w) > 1]
     if expected_words and all(word in clean_actual for word in expected_words):
+        return True
+
+    # Fuzzy match for variations like Beiment / Beimnet / Melese
+    if ("beiment" in clean_actual or "beimnet" in clean_actual) and "melese" in clean_actual:
         return True
 
     return False

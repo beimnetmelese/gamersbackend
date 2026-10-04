@@ -29,7 +29,16 @@ from .services import (
     WalletService, PaymentService, WithdrawalService,
     NotificationService, AuthService
 )
+from .telegram_auth import verify_telegram_init_data, get_or_create_telegram_user
 from .engines import resolve_game_winner
+
+
+def is_telegram_admin(telegram_id) -> bool:
+    if not telegram_id:
+        return False
+    from django.conf import settings
+    str_id = str(telegram_id).strip()
+    return str_id in [str(aid).strip() for aid in getattr(settings, 'TELEGRAM_ADMIN_IDS', [])]
 
 
 def is_user_admin(user) -> bool:
@@ -37,7 +46,76 @@ def is_user_admin(user) -> bool:
         return False
     if user.is_staff or user.is_superuser:
         return True
-    return hasattr(user, 'profile') and user.profile.role == 'ADMIN'
+    profile = getattr(user, 'profile', None)
+    if profile:
+        if profile.role == 'ADMIN':
+            return True
+        if profile.telegram_id and is_telegram_admin(profile.telegram_id):
+            return True
+    return False
+
+
+@api_view(['POST'])
+@permission_classes([permissions.AllowAny])
+def telegram_auth_view(request):
+    """
+    Authenticates or registers a Telegram user using Telegram initData or Telegram parameters.
+    Supports Telegram WebApp HMAC verification with configurable local bypass toggle.
+    Lookup & user identification is primarily performed by unique Telegram User ID.
+    """
+    init_data = request.data.get('initData', request.data.get('init_data', ''))
+    telegram_id = request.data.get('telegram_id', request.data.get('id', ''))
+    username = request.data.get('username')
+    first_name = request.data.get('first_name')
+    last_name = request.data.get('last_name')
+    photo_url = request.data.get('photo_url')
+
+    if init_data:
+        is_valid, parsed_data, msg = verify_telegram_init_data(init_data)
+        if not is_valid:
+            return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        user_obj = parsed_data.get('user_obj', {})
+        if user_obj:
+            if not telegram_id:
+                telegram_id = user_obj.get('id')
+            if username is None:
+                username = user_obj.get('username')
+            if first_name is None:
+                first_name = user_obj.get('first_name')
+            if last_name is None:
+                last_name = user_obj.get('last_name')
+            if photo_url is None:
+                photo_url = user_obj.get('photo_url')
+
+    if not telegram_id:
+        return Response({'error': 'Telegram User ID is required for Telegram authentication.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        user, profile, created = get_or_create_telegram_user(
+            telegram_id=str(telegram_id),
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            photo_url=photo_url
+        )
+    except Exception as e:
+        return Response({'error': f'Failed to process Telegram authentication: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not user.is_active:
+        return Response({'error': 'Account is suspended or deactivated.'}, status=status.HTTP_403_FORBIDDEN)
+
+    login(request, user)
+    wallet = WalletService.get_or_create_wallet(user)
+    token, _ = Token.objects.get_or_create(user=user)
+
+    return Response({
+        'message': 'Telegram login successful.',
+        'created': created,
+        'token': token.key,
+        'user': UserSerializer(user).data,
+        'wallet': WalletSerializer(wallet).data
+    }, status=status.HTTP_200_OK if not created else status.HTTP_201_CREATED)
 
 
 @api_view(['POST'])
@@ -309,12 +387,44 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         profile, _ = UserProfile.objects.get_or_create(user=user)
 
         if request.method == 'PATCH':
-            phone = request.data.get('phone_number')
+            first_name = request.data.get('first_name', request.data.get('firstName'))
+            last_name = request.data.get('last_name', request.data.get('lastName'))
+            email = request.data.get('email')
+            username = request.data.get('username')
+            phone = request.data.get('phone_number', request.data.get('phoneNumber'))
             bio = request.data.get('bio')
-            avatar = request.data.get('avatar_url')
+            avatar = request.data.get('avatar_url', request.data.get('avatarUrl'))
             notifs = request.data.get('notification_preferences')
             privacy = request.data.get('privacy_settings')
             lang = request.data.get('language')
+
+            user_updated = False
+            if first_name is not None:
+                clean_fn = str(first_name).strip()
+                user.first_name = clean_fn
+                profile.telegram_first_name = clean_fn
+                user_updated = True
+
+            if last_name is not None:
+                user.last_name = str(last_name).strip()
+                user_updated = True
+
+            if email is not None:
+                clean_email = str(email).strip()
+                if clean_email and User.objects.filter(email__iexact=clean_email).exclude(pk=user.pk).exists():
+                    return Response({'error': 'Email address is already registered by another account.'}, status=status.HTTP_400_BAD_REQUEST)
+                user.email = clean_email
+                user_updated = True
+
+            if username is not None and str(username).strip():
+                clean_uname = str(username).strip()
+                if User.objects.filter(username__iexact=clean_uname).exclude(pk=user.pk).exists():
+                    return Response({'error': 'Username is already taken by another account.'}, status=status.HTTP_400_BAD_REQUEST)
+                user.username = clean_uname
+                user_updated = True
+
+            if user_updated:
+                user.save()
 
             if phone is not None: profile.phone_number = phone
             if bio is not None: profile.bio = bio
@@ -324,13 +434,9 @@ class UserProfileViewSet(viewsets.ModelViewSet):
             if lang is not None: profile.language = lang
             profile.save()
 
-            if 'username' in request.data and request.data['username'].strip():
-                new_uname = request.data['username'].strip()
-                if not User.objects.filter(username__iexact=new_uname).exclude(pk=user.pk).exists():
-                    user.username = new_uname
-                    user.save()
-
-        return Response(UserProfileSerializer(profile).data)
+        data = UserProfileSerializer(profile).data
+        data['user'] = UserSerializer(user).data
+        return Response(data)
 
 
 class FavoriteViewSet(viewsets.ModelViewSet):

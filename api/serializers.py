@@ -18,12 +18,19 @@ class UserSerializer(serializers.ModelSerializer):
     account_status = serializers.CharField(source='profile.account_status', read_only=True)
     phone_number = serializers.CharField(source='profile.phone_number', read_only=True)
     avatar_url = serializers.CharField(source='profile.avatar_url', read_only=True)
+    telegram_id = serializers.CharField(source='profile.telegram_id', read_only=True)
+    telegram_username = serializers.CharField(source='profile.telegram_username', read_only=True)
+    telegram_first_name = serializers.CharField(source='profile.telegram_first_name', read_only=True)
     ban_reason = serializers.CharField(source='profile.ban_reason', read_only=True)
     banned_at = serializers.DateTimeField(source='profile.banned_at', read_only=True)
 
     class Meta:
         model = User
-        fields = ['id', 'username', 'email', 'first_name', 'last_name', 'role', 'account_status', 'phone_number', 'avatar_url', 'ban_reason', 'banned_at']
+        fields = [
+            'id', 'username', 'email', 'first_name', 'last_name', 'role',
+            'account_status', 'phone_number', 'avatar_url', 'telegram_id',
+            'telegram_username', 'telegram_first_name', 'ban_reason', 'banned_at'
+        ]
 
 
 class UserProfileSerializer(serializers.ModelSerializer):

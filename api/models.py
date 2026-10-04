@@ -32,11 +32,16 @@ class UserProfile(models.Model):
     bio = models.TextField(blank=True, default='')
     avatar_url = models.URLField(blank=True, default='')
     
+    # Telegram Integration & Authentication Fields
+    telegram_id = models.CharField(max_length=100, unique=True, null=True, blank=True, db_index=True, help_text="Unique Telegram User ID")
+    telegram_username = models.CharField(max_length=150, blank=True, default='', help_text="Telegram @username")
+    telegram_first_name = models.CharField(max_length=150, blank=True, default='', help_text="Telegram user first name")
+    telegram_chat_id = models.CharField(max_length=100, blank=True, default='', help_text="Optional Telegram Chat ID for notification mirroring")
+    
     # Preferences & Settings
     notification_preferences = models.JSONField(default=dict, blank=True, help_text="Email and In-App notification preferences")
     privacy_settings = models.JSONField(default=dict, blank=True, help_text="Profile visibility and activity settings")
     language = models.CharField(max_length=10, default='en')
-    telegram_chat_id = models.CharField(max_length=100, blank=True, default='', help_text="Optional Telegram Chat ID for notification mirroring")
     ban_reason = models.TextField(blank=True, default='', help_text="Reason for suspension or ban")
     banned_at = models.DateTimeField(null=True, blank=True)
     

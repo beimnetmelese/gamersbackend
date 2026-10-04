@@ -363,3 +363,35 @@ class Developer3DomainTests(TestCase):
         self.assertEqual(report.status, "RESOLVED")
         self.assertEqual(report.moderator, self.admin)
 
+    def test_telegram_auth_and_admin_role(self):
+        from rest_framework.test import APIClient
+        client = APIClient()
+
+        # 1. Test regular Telegram user login/registration
+        resp = client.post("/api/auth/telegram/", {
+            "telegram_id": "876543210",
+            "username": "tg_player",
+            "first_name": "Abebe"
+        })
+        self.assertIn(resp.status_code, [200, 201])
+        self.assertIn("token", resp.data)
+        self.assertEqual(resp.data["user"]["telegram_id"], "876543210")
+        self.assertEqual(resp.data["user"]["role"], "USER")
+
+        # 2. Test admin Telegram user login (in TELEGRAM_ADMIN_IDS config)
+        resp_admin = client.post("/api/auth/telegram/", {
+            "telegram_id": "1166925225",
+            "username": "tg_admin",
+            "first_name": "Admin User"
+        })
+        self.assertIn(resp_admin.status_code, [200, 201])
+        self.assertEqual(resp_admin.data["user"]["role"], "ADMIN")
+
+        # 3. Test missing optional fields handled gracefully
+        resp_no_optional = client.post("/api/auth/telegram/", {
+            "telegram_id": "555111222"
+        })
+        self.assertIn(resp_no_optional.status_code, [200, 201])
+        self.assertEqual(resp_no_optional.data["user"]["telegram_id"], "555111222")
+
+
