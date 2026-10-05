@@ -1,7 +1,7 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
-    register_user, login_user, logout_user, change_password, telegram_auth_view, get_user_stats,
+    register_user, login_user, logout_user, change_password, telegram_auth_view, get_user_stats, get_user_badges,
     UserProfileViewSet, FavoriteViewSet, NotificationViewSet,
     CategoryViewSet, ProductViewSet, GameViewSet, WalletViewSet, PaymentSubmissionViewSet,
     WithdrawalRequestViewSet, UserAdminViewSet, SellerApplicationViewSet,
@@ -32,5 +32,6 @@ urlpatterns = [
     path('auth/logout/', logout_user, name='logout_user'),
     path('auth/change_password/', change_password, name='change_password'),
     path('profiles/me/stats/', get_user_stats, name='user_stats'),
+    path('profiles/me/badges/', get_user_badges, name='user_badges'),
     path('', include(router.urls)),
 ]

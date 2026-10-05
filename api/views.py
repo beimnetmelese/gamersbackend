@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timedelta
 from decimal import Decimal
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import api_view, permission_classes, action
@@ -9,7 +10,9 @@ from django.contrib.auth import login, logout
 from django.contrib.auth.models import User
 from django.db import transaction
 from django.db.models import Sum, Count, Avg, Q
+from django.db.models.functions import TruncDate
 from django.utils import timezone
+from django.utils.dateparse import parse_date
 
 from .models import (
     Category, UserProfile, SellerProfile, Product, Game, GameParticipant,
@@ -244,6 +247,113 @@ def get_user_stats(request):
     user = request.user
     stats = AuthService.get_user_stats(user)
     return Response(stats)
+
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def get_user_badges(request):
+    user = request.user
+    badge_definitions = [
+        {'key': 'FIRST_ENTRY', 'name': 'First Step', 'description': 'Join your first competition.', 'icon': 'footprints', 'color': 'cyan', 'threshold': 1, 'field': 'entries', 'points': 25},
+        {'key': 'RISING_STAR', 'name': 'Rising Star', 'description': 'Complete five competition entries.', 'icon': 'sparkles', 'color': 'purple', 'threshold': 5, 'field': 'entries', 'points': 75},
+        {'key': 'WINNER_CIRCLE', 'name': "Winner's Circle", 'description': 'Win your first competition.', 'icon': 'trophy', 'color': 'amber', 'threshold': 1, 'field': 'wins', 'points': 100},
+        {'key': 'TOP_PERFORMER', 'name': 'Top Performer', 'description': 'Reach at least a 50% win rate across five games.', 'icon': 'target', 'color': 'emerald', 'threshold': 50, 'field': 'win_rate', 'points': 250},
+        {'key': 'CHAMPION', 'name': 'Champion', 'description': 'Win three competitions.', 'icon': 'crown', 'color': 'rose', 'threshold': 3, 'field': 'wins', 'points': 300},
+        {'key': 'HIGH_ROLLER', 'name': 'High Roller', 'description': 'Spend at least 1,000 ETB on competition entries.', 'icon': 'banknote', 'color': 'orange', 'threshold': 1000, 'field': 'spent', 'points': 150},
+        {'key': 'LOYAL_PLAYER', 'name': 'Loyal Player', 'description': 'Make twenty competition entries.', 'icon': 'flame', 'color': 'blue', 'threshold': 20, 'field': 'entries', 'points': 225},
+        {'key': 'EXPLORER', 'name': 'Game Explorer', 'description': 'Play three different game types.', 'icon': 'compass', 'color': 'teal', 'threshold': 3, 'field': 'game_types', 'points': 125},
+    ]
+
+    def player_metrics(target_user):
+        entries = list(GameParticipant.objects.filter(user=target_user).select_related('game'))
+        wins = GameResult.objects.filter(winner=target_user).count()
+        games_played = len({entry.game_id for entry in entries})
+        spent = sum((entry.game.entry_fee for entry in entries), Decimal('0.00'))
+        game_types = len({entry.game.game_type for entry in entries})
+        win_rate = round((wins / games_played) * 100, 1) if games_played else 0
+        return {
+            'entries': len(entries),
+            'wins': wins,
+            'games_played': games_played,
+            'spent': float(spent),
+            'game_types': game_types,
+            'win_rate': win_rate,
+            'points': len(entries) * 10 + wins * 100 + int(spent / Decimal('100')),
+        }
+
+    all_users = list(User.objects.all().order_by('username'))
+    metrics_by_user = {target.id: player_metrics(target) for target in all_users}
+    current_metrics = metrics_by_user.get(user.id, player_metrics(user))
+    badges = []
+    for badge in badge_definitions:
+        field = badge['field']
+        ranked = sorted(
+            all_users,
+            key=lambda target: (metrics_by_user[target.id][field], metrics_by_user[target.id]['points']),
+            reverse=True
+        )
+        current_score = current_metrics[field]
+        rank = next((index + 1 for index, target in enumerate(ranked) if target.id == user.id), len(ranked) + 1)
+        earned = current_score >= badge['threshold'] and (field != 'win_rate' or current_metrics['games_played'] >= 5)
+        leaderboard = [
+            {
+                'rank': index + 1,
+                'username': target.username,
+                'score': metrics_by_user[target.id][field],
+                'points': metrics_by_user[target.id]['points'],
+                'is_current_user': target.id == user.id,
+            }
+            for index, target in enumerate(ranked[:5])
+            if metrics_by_user[target.id][field] > 0
+        ]
+        if rank > 5 and current_score > 0:
+            leaderboard.append({'rank': rank, 'username': user.username, 'score': current_score, 'points': current_metrics['points'], 'is_current_user': True})
+        badges.append({
+            **badge,
+            'earned': earned,
+            'progress': current_score,
+            'rank': rank,
+            'leaderboard': leaderboard,
+        })
+
+    earned_points = sum(badge['points'] for badge in badges if badge['earned'])
+    def build_leaderboard(field):
+        ranked_users = sorted(
+            all_users,
+            key=lambda target: (metrics_by_user[target.id][field], metrics_by_user[target.id]['points']),
+            reverse=True
+        )
+        current_rank = next((index + 1 for index, target in enumerate(ranked_users) if target.id == user.id), len(ranked_users) + 1)
+        rows = [
+            {
+                'rank': index + 1,
+                'username': target.username,
+                'score': metrics_by_user[target.id][field],
+                'points': metrics_by_user[target.id]['points'],
+                'is_current_user': target.id == user.id,
+            }
+            for index, target in enumerate(ranked_users[:10])
+            if metrics_by_user[target.id][field] > 0
+        ]
+        if current_rank > 10 and metrics_by_user[user.id][field] > 0:
+            rows.append({
+                'rank': current_rank,
+                'username': user.username,
+                'score': metrics_by_user[user.id][field],
+                'points': metrics_by_user[user.id]['points'],
+                'is_current_user': True,
+            })
+        return {'rank': current_rank, 'rows': rows}
+
+    return Response({
+        'total_points': current_metrics['points'] + earned_points,
+        'metrics': current_metrics,
+        'badges': badges,
+        'leaderboards': {
+            'winners': build_leaderboard('wins'),
+            'games_played': build_leaderboard('games_played'),
+        },
+    })
 
 
 class CategoryViewSet(viewsets.ModelViewSet):
@@ -879,6 +989,84 @@ class UserAdminViewSet(viewsets.ViewSet):
             })
         return Response(data)
 
+    @action(detail=True, methods=['get'])
+    def details(self, request, pk=None):
+        if not is_user_admin(request.user):
+            return Response({'error': 'Admin access required.'}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            user = User.objects.select_related('profile', 'wallet', 'seller_profile').get(pk=pk)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        now = timezone.now()
+        requested_start = parse_date(request.query_params.get('start_date', ''))
+        requested_end = parse_date(request.query_params.get('end_date', ''))
+        period_start_date = requested_start or (now - timedelta(days=29)).date()
+        period_end_date = requested_end or now.date()
+        if period_end_date < period_start_date:
+            return Response({'error': 'end_date must be on or after start_date.'}, status=status.HTTP_400_BAD_REQUEST)
+        period_start = timezone.make_aware(datetime.combine(period_start_date, datetime.min.time()))
+        period_end = timezone.make_aware(datetime.combine(period_end_date + timedelta(days=1), datetime.min.time()))
+
+        wallet = getattr(user, 'wallet', None)
+        transactions = WalletTransaction.objects.filter(wallet=wallet, created_at__gte=period_start, created_at__lt=period_end).order_by('-created_at') if wallet else WalletTransaction.objects.none()
+        completed_transactions = transactions.filter(status='COMPLETED')
+        deposits = PaymentSubmission.objects.filter(user=user, submitted_at__gte=period_start, submitted_at__lt=period_end)
+        withdrawals = WithdrawalRequest.objects.filter(user=user, submitted_at__gte=period_start, submitted_at__lt=period_end)
+        entries = GameParticipant.objects.filter(user=user, joined_at__gte=period_start, joined_at__lt=period_end)
+        approved_deposits = deposits.filter(status='APPROVED')
+        approved_withdrawals = withdrawals.filter(status='APPROVED')
+        rewards = completed_transactions.filter(transaction_type='REWARD').aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        spent = completed_transactions.filter(transaction_type='GAME_ENTRY').aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+
+        return Response({
+            'user': UserSerializer(user).data,
+            'wallet': {
+                'balance': float(wallet.balance) if wallet else 0,
+                'reserved_balance': float(wallet.reserved_balance) if wallet else 0,
+                'available_balance': float(wallet.available_balance) if wallet else 0,
+            },
+            'activity': {
+                'game_entries': entries.count(),
+                'games_won': GameResult.objects.filter(winner=user, calculated_at__gte=period_start, calculated_at__lt=period_end).count(),
+                'favorites': Favorite.objects.filter(user=user).count(),
+                'unread_notifications': Notification.objects.filter(user=user, is_read=False).count(),
+                'last_login': user.last_login,
+                'date_joined': user.date_joined,
+            },
+            'financials': {
+                'period_start': period_start_date.isoformat(),
+                'period_end': period_end_date.isoformat(),
+                'deposits_approved': float(approved_deposits.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')),
+                'deposits_pending': float(deposits.filter(status='PENDING').aggregate(total=Sum('amount'))['total'] or Decimal('0.00')),
+                'deposits_refunded': float(deposits.filter(status='REFUNDED').aggregate(total=Sum('amount'))['total'] or Decimal('0.00')),
+                'withdrawals_approved': float(approved_withdrawals.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')),
+                'withdrawals_pending': float(withdrawals.filter(status='PENDING').aggregate(total=Sum('amount'))['total'] or Decimal('0.00')),
+                'entry_spend': float(abs(spent)),
+                'rewards_received': float(rewards),
+                'transaction_count': transactions.count(),
+            },
+            'seller': {
+                'business_name': user.seller_profile.business_name,
+                'status': user.seller_profile.status,
+                'address': user.seller_profile.address,
+                'created_at': user.seller_profile.created_at,
+            } if hasattr(user, 'seller_profile') else None,
+            'recent_transactions': [
+                {
+                    'id': tx.id,
+                    'type': tx.transaction_type,
+                    'direction': tx.direction,
+                    'status': tx.status,
+                    'amount': float(tx.amount),
+                    'note': tx.note,
+                    'created_at': tx.created_at,
+                }
+                for tx in transactions[:12]
+            ],
+        })
+
     @action(detail=True, methods=['post'])
     def toggle_status(self, request, pk=None):
         if not is_user_admin(request.user):
@@ -1016,8 +1204,41 @@ class UserAdminViewSet(viewsets.ViewSet):
         if not is_user_admin(request.user):
             return Response({'error': 'Admin access required.'}, status=status.HTTP_403_FORBIDDEN)
 
+        now = timezone.now()
+        requested_start = parse_date(request.query_params.get('start_date', ''))
+        requested_end = parse_date(request.query_params.get('end_date', ''))
+        period_start_date = requested_start or (now - timedelta(days=29)).date()
+        period_end_date = requested_end or now.date()
+        if period_end_date < period_start_date:
+            return Response({'error': 'end_date must be on or after start_date.'}, status=status.HTTP_400_BAD_REQUEST)
+        period_start = timezone.make_aware(datetime.combine(period_start_date, datetime.min.time()))
+        period_end = timezone.make_aware(datetime.combine(period_end_date + timedelta(days=1), datetime.min.time()))
+        trend_start = period_start
+        period_days = min((period_end_date - period_start_date).days + 1, 90)
+        retention_start = now - timedelta(days=30)
+
+        def daily_counts(queryset, field_name):
+            rows = queryset.filter(**{f'{field_name}__gte': trend_start, f'{field_name}__lt': period_end}).annotate(
+                day=TruncDate(field_name)
+            ).values('day').annotate(value=Count('id'))
+            values = {row['day'].isoformat(): row['value'] for row in rows if row['day']}
+            return [
+                {'date': (trend_start + timedelta(days=offset)).date().isoformat(),
+                 'value': values.get((trend_start + timedelta(days=offset)).date().isoformat(), 0)}
+                for offset in range(period_days)
+            ]
+
         total_users = User.objects.count()
         active_users = User.objects.filter(is_active=True).count()
+        active_users_30d = User.objects.filter(
+            Q(last_login__gte=retention_start) | Q(date_joined__gte=retention_start),
+            is_active=True
+        ).distinct().count()
+        retention_eligible = User.objects.filter(date_joined__lt=retention_start).count()
+        retained_users = User.objects.filter(
+            date_joined__lt=retention_start,
+            is_active=True
+        ).filter(Q(last_login__gte=retention_start)).count()
         banned_users = UserProfile.objects.filter(account_status='BANNED').count()
         verified_sellers = SellerProfile.objects.filter(status='VERIFIED').count()
         pending_sellers = SellerProfile.objects.filter(status='PENDING').count()
@@ -1032,14 +1253,53 @@ class UserAdminViewSet(viewsets.ViewSet):
         pending_products = Product.objects.filter(approval_status='PENDING').count()
         rejected_products = Product.objects.filter(approval_status='REJECTED').count()
 
-        total_deposits_val = PaymentSubmission.objects.filter(status='APPROVED').aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
-        pending_deposits_count = PaymentSubmission.objects.filter(status='PENDING').count()
+        period_payments = PaymentSubmission.objects.filter(submitted_at__gte=period_start, submitted_at__lt=period_end)
+        total_deposits_val = period_payments.filter(status='APPROVED').aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        pending_deposits_count = period_payments.filter(status='PENDING').count()
+        rejected_deposits_count = period_payments.filter(status='REJECTED').count()
+        refunded_deposits_val = period_payments.filter(status='REFUNDED').aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
 
-        total_withdrawals_val = WithdrawalRequest.objects.filter(status='APPROVED').aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
-        pending_withdrawals_count = WithdrawalRequest.objects.filter(status='PENDING').count()
+        period_withdrawals = WithdrawalRequest.objects.filter(submitted_at__gte=period_start, submitted_at__lt=period_end)
+        total_withdrawals_val = period_withdrawals.filter(status='APPROVED').aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        pending_withdrawals_count = period_withdrawals.filter(status='PENDING').count()
+        rejected_withdrawals_count = period_withdrawals.filter(status__in=['REJECTED', 'CANCELLED']).count()
 
-        total_entries = GameParticipant.objects.count()
-        platform_volume = GameParticipant.objects.aggregate(total=Sum('game__entry_fee'))['total'] or Decimal('0.00')
+        period_entries = GameParticipant.objects.filter(joined_at__gte=period_start, joined_at__lt=period_end)
+        total_entries = period_entries.count()
+        platform_volume = period_entries.aggregate(total=Sum('game__entry_fee'))['total'] or Decimal('0.00')
+        period_transactions = WalletTransaction.objects.filter(created_at__gte=period_start, created_at__lt=period_end)
+        refund_transactions_val = period_transactions.filter(
+            transaction_type='REFUND', status='COMPLETED'
+        ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        refund_transactions_val = abs(refund_transactions_val)
+        reward_transactions_val = period_transactions.filter(
+            transaction_type='REWARD', status='COMPLETED'
+        ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        game_entry_transactions = period_transactions.filter(
+            transaction_type='GAME_ENTRY', status='COMPLETED'
+        )
+        game_entry_count = game_entry_transactions.count()
+        average_entry_fee = abs(game_entry_transactions.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')) / game_entry_count if game_entry_count else Decimal('0.00')
+        average_deposit = total_deposits_val / period_payments.filter(status='APPROVED').count() if period_payments.filter(status='APPROVED').count() else Decimal('0.00')
+        average_withdrawal = total_withdrawals_val / period_withdrawals.filter(status='APPROVED').count() if period_withdrawals.filter(status='APPROVED').count() else Decimal('0.00')
+        commission_percent = Decimal(PlatformSetting.get_setting('platform_commission_percent', '10') or '10')
+        commission_val = platform_volume * commission_percent / Decimal('100')
+        net_commission_val = commission_val - refund_transactions_val
+        total_wallet_balance = Wallet.objects.aggregate(total=Sum('balance'))['total'] or Decimal('0.00')
+        reserved_wallet_balance = Wallet.objects.aggregate(total=Sum('reserved_balance'))['total'] or Decimal('0.00')
+        available_wallet_balance = max(Decimal('0.00'), total_wallet_balance - reserved_wallet_balance)
+        pending_withdrawal_value = period_withdrawals.filter(status='PENDING').aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        net_cash_flow = total_deposits_val - total_withdrawals_val
+        gross_profit = commission_val
+        cash_outflow = total_withdrawals_val + reward_transactions_val + refund_transactions_val
+        net_profit = gross_profit - refund_transactions_val
+        approved_deposit_count = period_payments.filter(status='APPROVED').count()
+        total_deposit_count = period_payments.count()
+        payout_ratio = (total_withdrawals_val / total_deposits_val) * Decimal('100') if total_deposits_val else Decimal('0.00')
+        refund_rate = (refund_transactions_val / platform_volume) * Decimal('100') if platform_volume else Decimal('0.00')
+        commission_margin = (gross_profit / platform_volume) * Decimal('100') if platform_volume else Decimal('0.00')
+        deposit_approval_rate = (Decimal(approved_deposit_count) / Decimal(total_deposit_count)) * Decimal('100') if total_deposit_count else Decimal('0.00')
+        post_withdrawal_liquidity = available_wallet_balance - pending_withdrawal_value
 
         total_deliveries = ProductDelivery.objects.count()
         pending_deliveries = ProductDelivery.objects.filter(status__in=['PREPARING', 'SHIPPED', 'OUT_FOR_DELIVERY']).count()
@@ -1047,13 +1307,46 @@ class UserAdminViewSet(viewsets.ViewSet):
 
         pending_reports = Report.objects.filter(status='PENDING').count()
 
+        game_type_rows = Game.objects.values('game_type').annotate(
+            games=Count('id'), participants=Count('participants')
+        ).order_by('-participants', '-games')[:8]
+        product_rows = Product.objects.filter(games__isnull=False).values(
+            'id', 'title', 'category'
+        ).annotate(
+            games=Count('games', distinct=True), participants=Count('games__participants')
+        ).order_by('-participants', '-games')[:8]
+
+        daily_participants = []
+        participant_rows = GameParticipant.objects.filter(joined_at__gte=trend_start, joined_at__lt=period_end).annotate(
+            day=TruncDate('joined_at')
+        ).values('day').annotate(value=Count('id'))
+        participant_values = {row['day'].isoformat(): row['value'] for row in participant_rows if row['day']}
+        revenue_rows = WalletTransaction.objects.filter(
+            created_at__gte=trend_start,
+            created_at__lt=period_end,
+            transaction_type='GAME_ENTRY',
+            status='COMPLETED'
+        ).annotate(day=TruncDate('created_at')).values('day').annotate(total=Sum('amount'))
+        revenue_values = {row['day'].isoformat(): abs(row['total'] or Decimal('0.00')) for row in revenue_rows if row['day']}
+        for offset in range(period_days):
+            day = (trend_start + timedelta(days=offset)).date().isoformat()
+            daily_participants.append({
+                'date': day,
+                'participants': participant_values.get(day, 0),
+                'revenue': float(revenue_values.get(day, Decimal('0.00'))),
+            })
+
         return Response({
             'users': {
                 'total': total_users,
                 'active': active_users,
+                'active_30d': active_users_30d,
                 'banned': banned_users,
                 'verified_sellers': verified_sellers,
                 'pending_sellers': pending_sellers,
+                'retention_rate': round((retained_users / retention_eligible) * 100, 1) if retention_eligible else 0,
+                'retention_eligible': retention_eligible,
+                'retained_users': retained_users,
             },
             'competitions': {
                 'total': total_games,
@@ -1069,11 +1362,39 @@ class UserAdminViewSet(viewsets.ViewSet):
                 'rejected': rejected_products,
             },
             'financials': {
+                'period_start': period_start_date.isoformat(),
+                'period_end': period_end_date.isoformat(),
                 'total_deposits_etb': float(total_deposits_val),
                 'pending_deposits_count': pending_deposits_count,
+                'rejected_deposits_count': rejected_deposits_count,
+                'refunded_deposits_etb': float(refunded_deposits_val),
                 'total_withdrawals_etb': float(total_withdrawals_val),
                 'pending_withdrawals_count': pending_withdrawals_count,
+                'rejected_withdrawals_count': rejected_withdrawals_count,
                 'platform_volume_etb': float(platform_volume),
+                'gross_revenue_etb': float(platform_volume),
+                'refunds_etb': float(refund_transactions_val),
+                'commission_percent': float(commission_percent),
+                'commission_etb': float(commission_val),
+                'net_commission_etb': float(net_commission_val),
+                'reward_payouts_etb': float(reward_transactions_val),
+                'average_entry_fee_etb': float(average_entry_fee),
+                'average_deposit_etb': float(average_deposit),
+                'average_withdrawal_etb': float(average_withdrawal),
+                'game_entry_count': game_entry_count,
+                'wallet_balance_etb': float(total_wallet_balance),
+                'reserved_wallet_balance_etb': float(reserved_wallet_balance),
+                'available_wallet_balance_etb': float(available_wallet_balance),
+                'pending_withdrawal_value_etb': float(pending_withdrawal_value),
+                'net_cash_flow_etb': float(net_cash_flow),
+                'gross_profit_etb': float(gross_profit),
+                'net_profit_etb': float(net_profit),
+                'cash_outflow_etb': float(cash_outflow),
+                'payout_ratio_percent': float(payout_ratio),
+                'refund_rate_percent': float(refund_rate),
+                'commission_margin_percent': float(commission_margin),
+                'deposit_approval_rate_percent': float(deposit_approval_rate),
+                'post_withdrawal_liquidity_etb': float(post_withdrawal_liquidity),
             },
             'fulfillment': {
                 'total_deliveries': total_deliveries,
@@ -1082,7 +1403,31 @@ class UserAdminViewSet(viewsets.ViewSet):
             },
             'moderation': {
                 'pending_reports': pending_reports,
-            }
+            },
+            'trends': {
+                'users': daily_counts(User.objects, 'date_joined'),
+                'sellers': daily_counts(SellerProfile.objects, 'created_at'),
+                'games': daily_counts(Game.objects, 'created_at'),
+                'daily_participants': daily_participants,
+            },
+            'popular_game_types': [
+                {
+                    'type': row['game_type'],
+                    'games': row['games'],
+                    'participants': row['participants'],
+                }
+                for row in game_type_rows
+            ],
+            'popular_products': [
+                {
+                    'id': row['id'],
+                    'title': row['title'],
+                    'category': row['category'],
+                    'games': row['games'],
+                    'participants': row['participants'],
+                }
+                for row in product_rows
+            ],
         })
 
 
